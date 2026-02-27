@@ -1,0 +1,36 @@
+A Telegram bot system that integrates access control management with AI-powered license plate recognition for automated gate control. The bot connects to Parsec access control system, allowing residents to authenticate via phone number, view their accessible devices (including cameras), and create passes either for regular access groups or for vehicles by license plate number.
+
+Core Features:
+
+Telegram bot with phone number authentication against Parsec system
+Create and manage access passes (regular access groups + vehicle-based by license plate)
+GPU-powered (A5000) license plate recognition from multiple camera streams with real-time monitoring
+Three-stage recognition pipeline with human-in-the-loop training: vehicle detection, license plate detection, and OCR character recognition
+Technical admin chat for supervised learning where bot posts recognition attempts and admins confirm/correct results (vehicle yes/no, plate detected yes/no, correct OCR or manual correction)
+Per-camera model weights that improve over time through continuous training
+Separate training pipeline (Docker Compose on external server) that retrains models when sufficient labeled data is collected
+Real-time gate control integration: when recognized plate matches active pass, automatically trigger gate opening
+Visual References:
+Inspired by enterprise admin panels like Parsec's own interface and monitoring dashboards like Grafana, known for their functional layouts and real-time data presentation.
+
+Style Guide:
+
+Colors: Primary #2C3E50 (dark blue-grey), Secondary #3498DB (blue), Success #27AE60 (green), Warning #F39C12 (orange), Error #E74C3C (red), Background #ECF0F1 (light grey), Text #2C3E50
+Design: Roboto/Inter fonts, dashboard layout with camera feed grid, status indicators, clean admin interface for corrections, mobile-responsive for Telegram interaction
+[В аттаче два проекта рефакторинг которых необходимо произвести
+
+распознавание номеров
+бот с доступом к системе
+Нам необходимо создать новый проект бота котоорый совмещает в себе эти функции
+фронт это общение с жителями, авторизация по номеру телефона из системы парсек получает все устройства кототрые доступны для управления включая камеры
+
+пользователь может создать пропуск как обычный в парсеке на те группы доступа которые ему можно так и на автомобиль по госномеру
+
+под капотом у бота распознавалка работает на gpu A5000 получает видеопотоки с камер и распознает на них номера, ведет учет, взаимодействует с парсеком и если пользователь создал пропуск то будет ждать этот номер что бы открыть ворота.
+
+в чем сложность? ракурсы у камер у всез разные. распознается очень плохо. надо сдлеать систему дообучения, есть отдельно тезнический чат (id берем из .env) куда бот пишет все попытки распощнать и просит помощи ( нажать кнопку) автобиль это или нет планка ли это автономера или нет, правильно ли распознан номер или надо корректировать (и пользватель руками корректирует)
+
+т.е. распощнается в три этапа и все три этапа мы дообуяаем, причем у каждой камеры свои веса которые мы дообучаем по ракурсам, обучаем отдельным процессом на другом сервер для этого создаем просто docker-compose -up который проведет сессию дообучения когда наберет достаточно материала.
+
+сложная задача?
+ну хорошо проявил себя в предыдущих, и я решил тебе дать по настоящему крутой проект, не подвевди! ]

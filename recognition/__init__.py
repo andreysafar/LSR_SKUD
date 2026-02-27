@@ -1,0 +1,1 @@
+from recognition.pipeline import RecognitionPipeline

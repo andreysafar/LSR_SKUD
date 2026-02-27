@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lpr_trainer
+    volumes:
+      - ../data/training:/app/data
+      - ../models:/app/models
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - TRAINING_EPOCHS=50
+      - TRAINING_BATCH_SIZE=16
+      - TRAINING_IMG_SIZE=640
+      - TRAINING_DATA_DIR=/app/data
+      - MODELS_DIR=/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: python3 train.py
+    restart: "no"

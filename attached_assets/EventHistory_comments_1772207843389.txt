@@ -1,0 +1,116 @@
+Описание и пример использования метода.
+1. Сессия для получения событий открывается методом
+	GuidResult OpenEventHistorySession(System.Guid sessionID, EventHistoryQueryParams parameters)
+	Возвращаемое значение GuidResult содержит сессию для последующего получения событий в поле Value. 
+Пример:
+===============================================================================================================================
+	Status.WaitMessage = "Открытие сессии для получения событий...";
+	EventHistoryQueryParams param = new EventHistoryQueryParams();
+	res = _integServ.OpenEventHistorySession(ClientState.SessionID, param);
+	if (res.Result != ClientState.Result_Success)
+	{
+		MessageBox.Show(res.ErrorMessage);
+		return;
+	}
+	_count = _integServ.GetEventHistoryResultCount(ClientState.SessionID, res.Value);
+===============================================================================================================================
+
+2. Экземпляр класса EventHistoryQueryParams, который передаётся в метод открытия сессии, содержит фильтр запрашиваемых событий.
+Если поле этого экземпляра null, то данный параметр не используется при фильтрации.
+Например:
+===============================================================================================================================
+	EventHistoryQueryParams param = new EventHistoryQueryParams();
+	param.StartDate = _dtpFrom.Value;
+	param.EndDate = _dtpTo.Value;
+	param.Territories = SyncParams.ReportTerritories.ToArray();
+	param.Organizations = SyncParams.ReportOrgUnits.ToArray();
+
+	param.EventsWithoutUser = false;
+	param.TransactionTypes = new uint[] { (uint)TransactionType.ActualEnter, (uint)TransactionType.ActualExit, (uint)TransactionType.ActualExitOfVisitor, (uint)TransactionType.ExitOutOfTimeProfile, (uint)TransactionType.NormalEnterByKey, (uint)TransactionType.NormalExitByKey, (uint)TransactionType.NormalExitOfVisitor };
+	param.MaxResultSize = (10000000);
+===============================================================================================================================
+
+В этом примере запрошены события с начальной и конечной датой, только от заданных территорий, только запрашиваемых организаций, только события связанные с сотрудниками, только заданных типов (вход/выход).
+Максимальное количество 10 миллионов событий. (Надо отметить, что на данный момент, если MaxResultSize не указан, то вернётся всего 5 тыс.)
+
+3. События получают методом.
+public EventObject[] GetEventHistoryResult(System.Guid sessionID, System.Guid eventHistorySessionID, System.Guid[] fields, int offset, int count)
+
+В него передаются 2 сессии. Вторая как раз та, что открывается с помощью OpenEventHistorySession.
+Третий параметр – список полей (Guid), которые нужно вернуть в результате (EventObject). Четвёртый параметр – сдвиг от нулевого события count – количество возвращаемых EventObject
+
+Пример:
+===============================================================================================================================
+	EventHistoryFields constants = new EventHistoryFields();
+	List<Guid> fields = new List<Guid>();
+	fields.Add(EventHistoryFields.EVENT_DATE);
+	fields.Add(EventHistoryFields.EVENT_TIME);
+	fields.Add(EventHistoryFields.EVENT_DESCRIPTION);
+	fields.Add(EventHistoryFields.EVENT_SOURCE);
+	fields.Add(EventHistoryFields.USER_NAME_0);
+	fields.Add(EventHistoryFields.USER_NAME_1);
+	fields.Add(EventHistoryFields.USER_NAME_2);
+	fields.Add(EventHistoryFields.USER_NAME_3);
+	fields.Add(EventHistoryFields.USER_ORGANIZATION);
+	fields.Add(EventHistoryFields.EVENT_AREA);
+	fields.Add(EventHistoryFields.EVENT_CODE);
+	// EventHistoryFields это константы. (список приведён ниже, см. п.5).
+	for (int chunck = 0; chunck < _count; chunck += nRetrive)
+	{
+		EventObject[] events = null;
+		nRetrive = Math.Max(Math.Min(_count / 10, 150), Math.Min(50, _count));
+		nRetrive = chunck + nRetrive <= _count ? nRetrive : _count - chunck;
+		events = _integServ.GetEventHistoryResult(SessionID, eventHistorySessionID, fields.ToArray(), chunck, nRetrive);
+	}
+===============================================================================================================================
+
+Надо отметить, что результат EventObject (массив строк ) содержит значения ровно в том порядке, который задан в списке полей List<Guid> fields. Первый элемент массива – это строка с EVENT_DATE, и т.д. 
+
+4. В конце сессию нужно закрыть. Тут вроде всё просто.
+===============================================================================================================================
+	_integServ.CloseEventHistorySession(SessionID, eventHistorySessionID);
+===============================================================================================================================
+
+5. Список констант получаемых полей.
+	public class EventHistoryFields
+	{
+		public static Guid USER_FULL_NAME = new Guid("1BF8A893-7D21-4c0c-9A2D-2E333A2D769D");
+		public static Guid USER_NAME_0 = new Guid("0de358e0-c91b-4333-b902-000000000003");
+		public static Guid USER_NAME_1 = new Guid("0de358e0-c91b-4333-b902-000000000001");
+		public static Guid USER_NAME_2 = new Guid("0de358e0-c91b-4333-b902-000000000002");
+		public static Guid USER_NAME_3 = new Guid("0de358e0-c91b-4333-b902-000000000006");
+		public static Guid USER_ID = new Guid("0de358e0-c91b-4333-b902-000000000005");
+		public static Guid USER_ID_VALID_FROM = new Guid("0de358e0-c91b-4333-b902-000000000007");
+		public static Guid USER_ID_VALID_TO = new Guid("0de358e0-c91b-4333-b902-000000000008");
+		public static Guid USER_ORGANIZATION = new Guid("0de358e0-c91b-4333-b902-000000000004");
+		public static Guid USER_ORGANIZATION_DESCRIPTION = new Guid("0A679144-D5CE-476d-A56E-0A696F079B71");
+		public static Guid USER_ACCESS_GROUP = new Guid("0de358e0-c91b-4333-b902-00000000000A");
+		public static Guid USER_PHOTO = new Guid("3AD06D24-43F6-45e0-8164-A98B4DA955DC");
+		public static Guid USER_DOMAIN = new Guid("0de358e0-c91b-4333-b902-000000000009");
+
+		//event
+		public static Guid EVENT_DESCRIPTION = new Guid("D1847AFF-11AA-4ef2-AAAA-795CEEFE5F9F");
+		public static Guid EVENT_SOURCE = new Guid("633904B5-971B-4751-96A0-92DC03D5F616");
+		public static Guid EVENT_DATE = new Guid("71B03D7B-2E11-47cd-BF47-ADAF320AEB10");
+		public static Guid EVENT_TIME = new Guid("C7AD4F51-D8AF-4944-BF92-23714715147E");
+		public static Guid EVENT_DATE_TIME = new Guid("2C5EE108-28E3-4dcc-8C95-7F3222D8E67F");
+		public static Guid EVENT_CODE = new Guid("C4AE9465-8375-4169-BA61-EB7E365A7352");
+		public static Guid EVENT_USER = new Guid("68EF9FD3-A72D-4520-9C63-5C37B0AE8539");
+		public static Guid EVENT_AREA = new Guid("4C5807CB-2C06-4725-9243-747E40C41D6C");
+		public static Guid EVENT_PART = new Guid("2AB38696-1E30-4e04-A956-B951CB7C2033");
+		public static Guid EVENT_WORKSTATION = new Guid("89C9D5AC-6E13-4715-A524-7C3B34931385");
+		public static Guid EVENT_OPERATOR = new Guid("FEA92E1C-E07D-4932-A6A1-E8C53E3087D9");
+		public static Guid EVENT_DETAILS = new Guid("03CEB65F-DCAD-4b56-94B8-BE9FDB463988");
+		public static Guid EVENT_SUMMARY = new Guid("E5AC823F-C4F6-48e7-BEBE-E6D44C57C7AD");
+		public static Guid EVENT_OPERATOR_COMMENTS = new Guid("66AA3A39-C866-4F34-9E99-E75F9918EAE7");
+		public static Guid EVENT_SUBJECT = new Guid("99914915-C882-4D11-80FF-57ACDC6CC015");
+		public static Guid EVENT_MESSAGE = new Guid("2F4A647E-4D9E-48AD-BF11-B1E49FFEAC7F");
+
+		//general
+		public static Guid COMPOUND = new Guid("13FDF20F-2B2D-4b47-AC60-97CAFF071F36");
+		public static Guid TEXT = new Guid("0de358e0-c91b-4333-b902-000000000000");
+	};
+
+Примечания:
+	1. Дата в функции передается в стандартном SOAP формате: ‘yyyy-mm-ddThh:mm:ss’ Подробнее можно глянуть тут: http://www.w3.org/TR/xmlschema-2/#dateTime
+	2. В параметрах «EventHistoryQueryParams» время нужно устанавливать в UTC.
