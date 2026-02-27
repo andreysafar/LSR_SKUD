@@ -9,7 +9,7 @@ VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 
 class VehicleDetector:
-    def __init__(self, weights_path: str = "models/yolov8n.pt",
+    def __init__(self, weights_path: str = "models/yolo26n.pt",
                  device: str = "cpu", confidence: float = 0.5):
         self.weights_path = weights_path
         self.device = device
@@ -26,8 +26,8 @@ class VehicleDetector:
                 self.model = YOLO(self.weights_path)
                 logger.info(f"Vehicle detector loaded: {self.weights_path}")
             else:
-                self.model = YOLO("yolov8n.pt")
-                logger.info("Vehicle detector loaded with default yolov8n.pt")
+                self.model = YOLO("yolo26n.pt")
+                logger.info("Vehicle detector loaded with default yolo26n.pt")
             self._loaded = True
         except ImportError:
             logger.warning("ultralytics not available, using simulation mode")

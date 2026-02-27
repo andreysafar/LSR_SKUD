@@ -58,7 +58,7 @@ class CameraDetectors:
         cam_weights_v = os.path.join(weights_dir, f"{camera_id}_vehicle.pt")
         cam_weights_p = os.path.join(weights_dir, f"{camera_id}_plate.pt")
 
-        vehicle_weights = cam_weights_v if os.path.exists(cam_weights_v) else config.get("weights_vehicle", "models/yolov8n.pt")
+        vehicle_weights = cam_weights_v if os.path.exists(cam_weights_v) else config.get("weights_vehicle", "models/yolo26n.pt")
         plate_weights = cam_weights_p if os.path.exists(cam_weights_p) else config.get("weights_plate", "models/license_plate_detector.pt")
 
         device = config.get("device", "cpu")

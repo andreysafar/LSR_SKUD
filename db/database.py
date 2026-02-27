@@ -81,7 +81,7 @@ class Database:
                     stream_url TEXT NOT NULL,
                     gate_device_id TEXT,
                     mask_path TEXT,
-                    weights_vehicle TEXT DEFAULT 'models/yolov8n.pt',
+                    weights_vehicle TEXT DEFAULT 'models/yolo26n.pt',
                     weights_plate TEXT DEFAULT 'models/license_plate_detector.pt',
                     enabled INTEGER DEFAULT 1,
                     last_frame_at TEXT,

@@ -9,7 +9,7 @@ Telegram bot system integrating Parsec access control with AI-powered license pl
 - **Streamlit Dashboard** (`app.py`, `pages/`) — Monitoring UI with camera status, recognition events, pass management, training status, and settings
 - **Telegram Bot** (`bot/`) — User-facing bot for phone authentication, pass creation (vehicle + access group), and admin review chat
 - **Parsec API Client** (`parsec/`) — SOAP API integration with Parsec access control system
-- **Recognition Pipeline** (`recognition/`) — Three-stage: vehicle detection (YOLOv8) → plate detection (custom YOLO) → OCR (EasyOCR)
+- **Recognition Pipeline** (`recognition/`) — Three-stage: vehicle detection (YOLO26) → plate detection (custom YOLO) → OCR (EasyOCR)
 - **Gate Controller** (`gate/`) — Matches recognized plates against active passes, triggers gate opening via Parsec
 - **Training System** (`training/`) — Collects human-labeled data, exports for retraining, Docker Compose for GPU training server
 
@@ -35,7 +35,7 @@ parsec/
   api.py                  # Parsec SOAP API client
 recognition/
   pipeline.py             # Three-stage recognition orchestrator
-  vehicle_detector.py     # Stage 1: YOLOv8 vehicle detection
+  vehicle_detector.py     # Stage 1: YOLO26 vehicle detection
   plate_detector.py       # Stage 2: License plate detection
   ocr_engine.py           # Stage 3: EasyOCR text recognition
   camera_manager.py       # RTSP camera stream manager
@@ -45,7 +45,7 @@ training/
   collector.py            # Training data collection
   manager.py              # Training session management
   train.py                # Training script (runs in Docker)
-  Dockerfile              # GPU training container
+  Dockerfile              # GPU training container (CUDA 12.4)
   docker-compose.yml      # Training deployment
 db/
   database.py             # SQLite database with full schema
@@ -83,4 +83,4 @@ The Parsec API client (`parsec/api.py`) uses SOAP/WSDL via `zeep` library, follo
 - (On GPU server: ultralytics, easyocr, opencv-python, torch)
 
 ### Training Pipeline
-Per-camera model weights are trained separately. Human-in-the-loop via Telegram admin chat where admins confirm/correct three stages: vehicle detection, plate detection, OCR. When enough labeled samples collected (default 50), training data is exported. Run `docker-compose up` in `training/` directory on GPU server to retrain.
+Per-camera model weights are trained separately using YOLO26 (latest Ultralytics, January 2026). Human-in-the-loop via Telegram admin chat where admins confirm/correct three stages: vehicle detection, plate detection, OCR. When enough labeled samples collected (default 50), training data is exported. Run `docker-compose up` in `training/` directory on GPU server to retrain. Training includes automatic validation with mAP50/mAP50-95/precision/recall metrics saved per model. Default vehicle detector weights: `yolo26n.pt`.

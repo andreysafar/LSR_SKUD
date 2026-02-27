@@ -10,7 +10,7 @@ class CameraConfig:
     stream_url: str
     gate_device_id: str = ""
     mask_path: str = ""
-    weights_vehicle: str = "models/yolov8n.pt"
+    weights_vehicle: str = "models/yolo26n.pt"
     weights_plate: str = "models/license_plate_detector.pt"
     enabled: bool = True
 
@@ -46,6 +46,8 @@ class Config:
     device: str = "cpu"
 
     min_training_samples: int = 50
+
+    default_vehicle_model: str = "yolo26n.pt"
 
     cameras: List[CameraConfig] = field(default_factory=list)
 
