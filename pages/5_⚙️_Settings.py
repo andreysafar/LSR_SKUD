@@ -23,7 +23,7 @@ with col2:
     parsec_status = "Unknown"
     if config.parsec_domain:
         from parsec.api import ParsecAPI
-        api = ParsecAPI(config.parsec_domain, config.parsec_port)
+        api = ParsecAPI(host=config.parsec_domain, port=config.parsec_port)
         if api.check_connection():
             parsec_status = "Connected"
             st.success("✅ Parsec server reachable")
@@ -93,6 +93,7 @@ TELEGRAM_API_HASH=your_api_hash
 
 PARSEC_DOMAIN=192.168.1.100
 PARSEC_PORT=10101
+PARSEC_ORGANIZATION=SYSTEM
 PARSEC_BOT_USERNAME=bot_operator
 PARSEC_BOT_PASSWORD=bot_password
 PARSEC_ADMIN_USERNAME=admin

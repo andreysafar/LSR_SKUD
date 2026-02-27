@@ -24,8 +24,9 @@ class TelegramBot:
         self.config = get_config()
         self.db = get_db(self.config.db_path)
         self.parsec = ParsecAPI(
-            domain=self.config.parsec_domain,
+            host=self.config.parsec_domain,
             port=self.config.parsec_port,
+            organization=self.config.parsec_organization,
             bot_username=self.config.parsec_bot_username,
             bot_password=self.config.parsec_bot_password,
             admin_username=self.config.parsec_admin_username,

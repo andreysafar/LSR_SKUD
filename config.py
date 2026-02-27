@@ -23,6 +23,7 @@ class Config:
 
     parsec_domain: str = ""
     parsec_port: int = 10101
+    parsec_organization: str = "SYSTEM"
     parsec_bot_username: str = ""
     parsec_bot_password: str = ""
     parsec_admin_username: str = ""
@@ -56,6 +57,7 @@ class Config:
             telegram_api_hash=os.environ.get("TELEGRAM_API_HASH", ""),
             parsec_domain=os.environ.get("PARSEC_DOMAIN", ""),
             parsec_port=int(os.environ.get("PARSEC_PORT", "10101")),
+            parsec_organization=os.environ.get("PARSEC_ORGANIZATION", "SYSTEM"),
             parsec_bot_username=os.environ.get("PARSEC_BOT_USERNAME", ""),
             parsec_bot_password=os.environ.get("PARSEC_BOT_PASSWORD", ""),
             parsec_admin_username=os.environ.get("PARSEC_ADMIN_USERNAME", ""),

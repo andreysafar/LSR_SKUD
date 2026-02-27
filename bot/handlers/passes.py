@@ -1,5 +1,6 @@
 import logging
 import re
+import secrets
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
 
@@ -25,29 +26,22 @@ def normalize_plate_input(text: str) -> str:
     return ''.join(result)
 
 
+def plate_to_hex_code(plate: str) -> str:
+    plate_bytes = plate.encode("utf-8")
+    hex_str = plate_bytes.hex().upper()
+    if len(hex_str) < 8:
+        hex_str = hex_str.ljust(8, "0")
+    elif len(hex_str) > 8:
+        hex_str = hex_str[:8]
+    return hex_str
+
+
 class PassHandler:
     def __init__(self, db, parsec_api):
         self.db = db
         self.parsec = parsec_api
 
-    def create_vehicle_pass(self, user_id: int, plate_number: str,
-                             duration: str = "day_end") -> Dict:
-        result = {
-            "success": False,
-            "message": "",
-            "pass_data": None,
-        }
-
-        plate_clean = normalize_plate_input(plate_number)
-        if not plate_clean:
-            result["message"] = "Invalid plate number"
-            return result
-
-        user = self.db.get_user(user_id)
-        if not user:
-            result["message"] = "User not authenticated"
-            return result
-
+    def _compute_validity(self, duration: str):
         now = datetime.now()
         if duration == "day_end":
             valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -69,6 +63,56 @@ class PassHandler:
             valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
             valid_to = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
             duration_text = "for 24 hours"
+        return valid_from, valid_to, duration_text
+
+    def create_vehicle_pass(self, user_id: int, plate_number: str,
+                             access_group_id: str = None,
+                             duration: str = "day_end") -> Dict:
+        result = {
+            "success": False,
+            "message": "",
+            "pass_data": None,
+        }
+
+        plate_clean = normalize_plate_input(plate_number)
+        if not plate_clean:
+            result["message"] = "Invalid plate number"
+            return result
+
+        user = self.db.get_user(user_id)
+        if not user:
+            result["message"] = "User not authenticated"
+            return result
+
+        valid_from, valid_to, duration_text = self._compute_validity(duration)
+
+        parsec_identifier_code = None
+        if self.parsec and self.parsec.host and access_group_id:
+            try:
+                session_data = self.parsec.open_admin_session()
+                if session_data:
+                    session_id = session_data["session_id"]
+                    plate_code = self.parsec.get_unique_card_code(session_id) or secrets.token_hex(4).upper()
+                    vehicle_id = self.parsec.create_vehicle(
+                        session_id, plate_number=plate_clean,
+                        org_id=session_data.get("root_org_unit_id"),
+                    )
+                    if vehicle_id:
+                        success = self.parsec.add_vehicle_plate_identifier(
+                            session_id, vehicle_id, access_group_id,
+                            plate_code=plate_code, name=plate_clean,
+                            valid_from=valid_from, valid_to=valid_to,
+                        )
+                        if success:
+                            parsec_identifier_code = plate_code
+                            logger.info(f"Parsec vehicle+identifier created: {plate_clean}")
+                        else:
+                            logger.warning(f"Failed to add plate identifier in Parsec for {plate_clean}")
+                    else:
+                        logger.warning(f"Failed to create vehicle in Parsec for {plate_clean}")
+                    self.parsec.close_session(session_id)
+            except Exception as e:
+                logger.error(f"Parsec vehicle pass creation failed: {e}")
 
         pass_data = self.db.create_pass(
             user_id=user_id,
@@ -76,7 +120,8 @@ class PassHandler:
             plate_number=plate_clean,
             valid_from=valid_from,
             valid_to=valid_to,
-            access_group_id=user.get("default_access_group"),
+            access_group_id=access_group_id or user.get("default_access_group"),
+            parsec_pass_id=parsec_identifier_code,
         )
 
         result["success"] = True
@@ -99,29 +144,26 @@ class PassHandler:
             result["message"] = "User not authenticated"
             return result
 
-        now = datetime.now()
-        if duration == "day_end":
-            valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
-            valid_to = now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%d %H:%M:%S")
-        elif duration == "24hours":
-            valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
-            valid_to = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
-            valid_to = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        valid_from, valid_to, _ = self._compute_validity(duration)
 
-        parsec_pass_id = None
-        if self.parsec and self.parsec.domain and user.get("parsec_person_id"):
+        parsec_identifier_code = None
+        if self.parsec and self.parsec.host and user.get("parsec_person_id"):
             try:
-                session_id = self.parsec.open_admin_session()
-                if session_id:
-                    parsec_pass_id = self.parsec.create_pass(
+                session_data = self.parsec.open_admin_session()
+                if session_data:
+                    session_id = session_data["session_id"]
+                    code = secrets.token_hex(4).upper()
+                    success = self.parsec.add_access_identifier(
                         session_id, user["parsec_person_id"],
-                        access_group_id, valid_from, valid_to,
+                        accgroup_id=access_group_id, code=code,
+                        name=access_group_name,
+                        valid_from=valid_from, valid_to=valid_to,
                     )
+                    if success:
+                        parsec_identifier_code = code
                     self.parsec.close_session(session_id)
             except Exception as e:
-                logger.error(f"Parsec pass creation failed: {e}")
+                logger.error(f"Parsec access pass creation failed: {e}")
 
         pass_data = self.db.create_pass(
             user_id=user_id,
@@ -130,7 +172,7 @@ class PassHandler:
             access_group_name=access_group_name,
             valid_from=valid_from,
             valid_to=valid_to,
-            parsec_pass_id=parsec_pass_id,
+            parsec_pass_id=parsec_identifier_code,
         )
 
         result["success"] = True
@@ -145,6 +187,16 @@ class PassHandler:
         passes = self.db.get_active_passes(user_id)
         for p in passes:
             if p["id"] == pass_id:
+                if p.get("parsec_pass_id") and self.parsec and self.parsec.host:
+                    try:
+                        session_data = self.parsec.open_admin_session()
+                        if session_data:
+                            self.parsec.delete_identifier(
+                                session_data["session_id"], p["parsec_pass_id"]
+                            )
+                            self.parsec.close_session(session_data["session_id"])
+                    except Exception as e:
+                        logger.error(f"Parsec identifier deletion failed: {e}")
                 self.db.deactivate_pass(pass_id)
                 return True
         return False

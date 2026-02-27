@@ -14,6 +14,17 @@ class GateController:
         self.db = get_db()
         self._session_id = None
 
+    def _ensure_session(self) -> Optional[str]:
+        if self._session_id:
+            if self.parsec and self.parsec.continue_session(self._session_id):
+                return self._session_id
+        if self.parsec:
+            session_data = self.parsec.open_admin_session()
+            if session_data:
+                self._session_id = session_data["session_id"]
+                return self._session_id
+        return None
+
     def check_plate_and_open(self, camera_id: str, plate_number: str,
                               event_id: int = None) -> Dict:
         result = {
@@ -48,15 +59,13 @@ class GateController:
                 camera = cam
                 break
 
-        gate_device_id = camera.get("gate_device_id", "") if camera else ""
+        gate_territory_id = camera.get("gate_device_id", "") if camera else ""
 
-        if gate_device_id and self.parsec:
+        if gate_territory_id and self.parsec:
             try:
-                if not self._session_id:
-                    self._session_id = self.parsec.open_admin_session()
-
-                if self._session_id:
-                    success = self.parsec.open_door(self._session_id, gate_device_id)
+                session_id = self._ensure_session()
+                if session_id:
+                    success = self.parsec.open_gate(session_id, gate_territory_id)
                     result["gate_opened"] = success
                     result["details"] = "Gate opened successfully" if success else "Failed to open gate"
                 else:
@@ -64,9 +73,10 @@ class GateController:
             except Exception as e:
                 result["details"] = f"Gate control error: {e}"
                 logger.error(f"Gate control error: {e}")
+                self._session_id = None
         else:
             result["gate_opened"] = True
-            result["details"] = "Gate open signal sent (simulated)" if not gate_device_id else "Parsec not configured"
+            result["details"] = "Gate open signal sent (simulated)" if not gate_territory_id else "Parsec not configured"
 
         self.db.save_gate_event(
             camera_id=camera_id,

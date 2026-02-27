@@ -53,9 +53,25 @@ data/                     # Runtime data directory
 models/                   # Model weights directory
 ```
 
+### Parsec API Integration
+The Parsec API client (`parsec/api.py`) uses SOAP/WSDL via `zeep` library, following the `IntegrationalServiceSession` pattern from the official SDK. Key API functions used:
+- **OpenSession(organization, username, password)** → returns `SessionResult` with `.Value.SessionID`, `.Value.RootOrgUnitID`, `.Value.RootTerritoryID`; `.Result == -1` means error
+- **FindPeople(sessionId, lastname, firstname, middlename)** — search by name (NOT by phone)
+- **PersonSearch(sessionId, fieldID, relation, value, value1)** — search by extra field (used for phone number lookup via extra field templates)
+- **GetAccessGroups(sessionId)** — returns objects with `.ID`, `.NAME`, `.IDENTIFTYPE` (0=Parsec access, 1=license plate)
+- **CreateVehicle(sessionId, person)** — creates a vehicle entry (uses `LAST_NAME=plate`, `FIRST_NAME=model`, `MIDDLE_NAME=color`)
+- **OpenPersonEditingSession(sessionId, personId)** → returns edit session ID
+- **AddPersonIdentifier(editSessionId, Identifier)** — adds identifier with `IDENTIFTYPE=0` (access card) or `IDENTIFTYPE=1` (license plate)
+- **ClosePersonEditingSession(editSessionId)** — closes edit session
+- **SendHardwareCommand(sessionId, territoryID, command)** — command `1` = open door/gate
+- **DeleteIdentifier(sessionId, code)** — removes identifier by code
+- Namespace resolution: `client.get_type(f"{namespace}:Identifier")` for WSDL type construction
+- `gate_device_id` in camera config maps to Parsec territory ID (the "door" territory)
+
 ### Key Environment Variables
 - `TELEGRAM_BOT_TOKEN` — Telegram bot token
 - `PARSEC_DOMAIN`, `PARSEC_PORT` — Parsec server connection
+- `PARSEC_ORGANIZATION` — Parsec organization name (default: "SYSTEM")
 - `PARSEC_BOT_USERNAME`, `PARSEC_BOT_PASSWORD` — Bot operator credentials
 - `PARSEC_ADMIN_USERNAME`, `PARSEC_ADMIN_PASSWORD` — Admin credentials
 - `TECH_CHAT_ID` — Telegram chat for admin review/training
@@ -63,7 +79,7 @@ models/                   # Model weights directory
 - `GPU_ENABLED`, `DEVICE` — GPU/CPU configuration
 
 ### Dependencies
-- streamlit, python-telegram-bot, pyyaml, pydantic
+- streamlit, python-telegram-bot, pyyaml, pydantic, zeep
 - (On GPU server: ultralytics, easyocr, opencv-python, torch)
 
 ### Training Pipeline
