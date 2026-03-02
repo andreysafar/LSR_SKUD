@@ -31,6 +31,15 @@ waitForPort = 5000
 [workflows.workflow.metadata]
 outputType = "webview"
 
+[[workflows.workflow]]
+name = "bh"
+mode = "parallel"
+author = 55310287
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "ls -la"
+
 [[ports]]
 localPort = 5000
 externalPort = 80
