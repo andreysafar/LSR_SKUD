@@ -16,7 +16,10 @@ from multiprocessing import Manager
 import torch
 
 # Import the refactored worker class
-from .neural_worker import AnalysisWorker
+from .neural_worker import ModernAnalysisWorker, init_modern_neural_worker, get_worker_instance
+from config import Config, get_config
+from config.anpr_config import ANPRBatchConfig
+from db import get_db, ANPRDatabaseIntegration, BatchProcessingResult
 
 # Global variable to hold the worker instance for each process
 worker = None
@@ -29,6 +32,312 @@ neural_executor = None
 assigned_gpu_id = 0
 gpu_counter = None
 lock = None
+
+
+class ModernBatchProcessor:
+    """Modern batch processor with database integration and monitoring."""
+    
+    def __init__(self, config: Optional[Config] = None):
+        self.config = config or get_config()
+        self.logger = self._setup_logger()
+        self.db = get_db(self.config.db_path)
+        self.db_integration = ANPRDatabaseIntegration(self.db)
+        self.session_id = None
+        
+        # Performance monitoring
+        self.start_time = None
+        self.processed_files = 0
+        self.success_files = 0
+        self.error_files = 0
+        
+        self.logger.info("Modern batch processor initialized")
+    
+    def _setup_logger(self) -> logging.Logger:
+        """Setup logger for the batch processor."""
+        logger = logging.getLogger(self.__class__.__name__)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        return logger
+    
+    def process_videos_dual_pipeline(self, session_config: ANPRBatchConfig):
+        """Enhanced dual pipeline processing with database integration."""
+        # Create database session
+        self.session_id = self.db_integration.create_batch_session(session_config)
+        self.start_time = datetime.datetime.now()
+        
+        try:
+            # Enhanced dual pipeline with database integration
+            results = self._run_dual_pipeline(session_config)
+            self._finalize_session(results, "COMPLETED")
+            return results
+        except Exception as e:
+            error_msg = f"Batch processing failed: {str(e)}"
+            self.logger.error(error_msg)
+            self.db_integration.mark_session_failed(self.session_id, error_msg)
+            raise
+    
+    def _run_dual_pipeline(self, config: ANPRBatchConfig) -> List[BatchProcessingResult]:
+        """Run the dual pipeline with enhanced monitoring."""
+        self.logger.info("Starting enhanced dual pipeline processing...")
+        
+        # Count total files first
+        total_files = self._count_files(config)
+        self.db_integration.update_session_totals(self.session_id, total_files)
+        
+        results = []
+        
+        # Preserve original dual-pipeline architecture but add database logging
+        mp_context = multiprocessing.get_context("spawn")
+        
+        with ProcessPoolExecutor(max_workers=config.cpu_workers, mp_context=mp_context) as ffmpeg_executor, \
+             ProcessPoolExecutor(max_workers=config.gpu_workers, 
+                               initializer=init_modern_neural_worker, 
+                               initargs=(self.config,), mp_context=mp_context) as neural_executor:
+            
+            # Enhanced processing loop with database integration
+            ffmpeg_futures = []
+            neural_futures = []
+            
+            # Process files using the original logic but with enhanced monitoring
+            for task_info in self._generate_tasks(config):
+                # Submit to FFmpeg pipeline
+                if config.ffmpeg_gpu_workers > 0:
+                    future = ffmpeg_executor.submit(ffmpeg_gpu_worker_task, task_info)
+                else:
+                    future = ffmpeg_executor.submit(ffmpeg_worker_task, task_info)
+                ffmpeg_futures.append(future)
+                
+                # Process completed FFmpeg tasks
+                self._process_completed_ffmpeg_tasks(
+                    ffmpeg_futures, neural_executor, neural_futures
+                )
+                
+                # Process completed neural tasks
+                completed_results = self._process_completed_neural_tasks(neural_futures)
+                results.extend(completed_results)
+            
+            # Process remaining tasks
+            self._process_remaining_tasks(ffmpeg_futures, neural_executor, neural_futures)
+            final_results = self._process_completed_neural_tasks(neural_futures)
+            results.extend(final_results)
+        
+        return results
+    
+    def _count_files(self, config: ANPRBatchConfig) -> int:
+        """Count total files to be processed."""
+        total = 0
+        for input_dir in config.input_directories:
+            if os.path.exists(input_dir):
+                for root, dirs, files in os.walk(input_dir):
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    for file in files:
+                        if file.endswith(config.video_extension):
+                            full_path = os.path.join(root, file)
+                            try:
+                                if os.path.getsize(full_path) >= 1024 * 1024:  # 1MB minimum
+                                    total += 1
+                            except OSError:
+                                pass
+        return total
+    
+    def _generate_tasks(self, config: ANPRBatchConfig):
+        """Generate processing tasks from configuration."""
+        # This uses the same logic as the original process_videos_dual_pipeline
+        # but yields tasks instead of processing them directly
+        
+        # Folder format cache
+        folder_format_cache = {}
+        
+        for input_dir in config.input_directories:
+            if not os.path.exists(input_dir):
+                self.logger.warning(f"Directory not found: {input_dir}")
+                continue
+                
+            folder = os.path.basename(input_dir)
+            
+            # Detect format for first file (caching optimization)
+            if folder not in folder_format_cache:
+                format_args = []
+                for root, dirs, files in os.walk(input_dir):
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    for file in files:
+                        if file.endswith(config.video_extension):
+                            full_path = os.path.join(root, file)
+                            try:
+                                if os.path.getsize(full_path) >= 1024 * 1024:
+                                    format_args = detect_video_format(full_path)
+                                    break
+                            except OSError:
+                                pass
+                    if format_args:
+                        break
+                folder_format_cache[folder] = format_args
+            
+            # Generate tasks for this directory
+            for task in self._generate_directory_tasks(input_dir, folder_format_cache[folder]):
+                yield task
+    
+    def _generate_directory_tasks(self, input_dir: str, format_args: list):
+        """Generate tasks for a specific directory."""
+        file_list = []
+        
+        for root, dirs, files in os.walk(input_dir):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for file in files:
+                if file.endswith(self.config.anpr_batch.video_extension):
+                    full_path = os.path.join(root, file)
+                    try:
+                        if os.path.getsize(full_path) >= 1024 * 1024:  # 1MB
+                            mtime = os.path.getmtime(full_path)
+                            file_list.append((full_path, mtime))
+                    except OSError:
+                        pass
+        
+        # Sort by modification time (newest first)
+        file_list.sort(key=lambda x: x[1], reverse=True)
+        
+        # Generate tasks
+        for full_path, _ in file_list:
+            relative_path = os.path.relpath(os.path.dirname(full_path), input_dir)
+            path_parts = relative_path.split(os.sep)
+            
+            if path_parts and path_parts[0] != '.':
+                folder = os.path.basename(input_dir)
+                subfolder = path_parts[0]
+            else:
+                folder = os.path.basename(input_dir)
+                subfolder = 'root'
+            
+            yield (full_path, folder, subfolder, format_args)
+    
+    def _process_completed_ffmpeg_tasks(self, ffmpeg_futures, neural_executor, neural_futures):
+        """Process completed FFmpeg tasks and submit to neural pipeline."""
+        completed = [f for f in ffmpeg_futures if f.done()]
+        
+        for future in completed:
+            try:
+                converted_info = future.result()
+                if converted_info['success']:
+                    neural_future = neural_executor.submit(modern_neural_worker_task, converted_info)
+                    neural_futures.append(neural_future)
+                else:
+                    # Log failed conversion
+                    self._log_processing_result(
+                        BatchProcessingResult(
+                            file_path=converted_info['original_video_path'],
+                            folder_name="unknown",
+                            subfolder_name="unknown", 
+                            processing_time=0.0,
+                            success=False,
+                            error_message=converted_info.get('error', 'FFmpeg conversion failed')
+                        )
+                    )
+                ffmpeg_futures.remove(future)
+            except Exception as e:
+                self.logger.error(f"Error processing FFmpeg result: {e}")
+                ffmpeg_futures.remove(future)
+    
+    def _process_completed_neural_tasks(self, neural_futures) -> List[BatchProcessingResult]:
+        """Process completed neural tasks and return results."""
+        completed = [f for f in neural_futures if f.done()]
+        results = []
+        
+        for future in completed:
+            try:
+                result = future.result()
+                self._log_processing_result(result)
+                results.append(result)
+                neural_futures.remove(future)
+            except Exception as e:
+                self.logger.error(f"Error processing neural result: {e}")
+                neural_futures.remove(future)
+        
+        return results
+    
+    def _process_remaining_tasks(self, ffmpeg_futures, neural_executor, neural_futures):
+        """Process all remaining FFmpeg tasks."""
+        for future in as_completed(ffmpeg_futures):
+            try:
+                converted_info = future.result()
+                if converted_info['success']:
+                    neural_future = neural_executor.submit(modern_neural_worker_task, converted_info)
+                    neural_futures.append(neural_future)
+            except Exception as e:
+                self.logger.error(f"Error processing remaining FFmpeg result: {e}")
+    
+    def _log_processing_result(self, result: BatchProcessingResult):
+        """Log processing result to database."""
+        try:
+            self.db_integration.log_batch_result(self.session_id, result)
+            
+            if result.success:
+                self.success_files += 1
+                status = "✓"
+            else:
+                self.error_files += 1 
+                status = "✗"
+            
+            self.processed_files += 1
+            
+            # Log progress
+            progress = f"[{self.processed_files}/?]"
+            video_name = os.path.basename(result.file_path)
+            self.logger.info(f"{status} {progress} {video_name}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to log processing result: {e}")
+    
+    def _finalize_session(self, results: List[BatchProcessingResult], status: str):
+        """Finalize the processing session."""
+        try:
+            self.db_integration.mark_session_completed(self.session_id, status)
+            
+            elapsed_time = (datetime.datetime.now() - self.start_time).total_seconds()
+            
+            self.logger.info(f"Session completed: {self.session_id}")
+            self.logger.info(f"Total files processed: {self.processed_files}")
+            self.logger.info(f"Successful: {self.success_files}")
+            self.logger.info(f"Failed: {self.error_files}")
+            self.logger.info(f"Total time: {elapsed_time:.2f}s")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to finalize session: {e}")
+
+
+def modern_neural_worker_task(converted_info: Dict[str, Any]) -> BatchProcessingResult:
+    """Modern neural worker task that returns BatchProcessingResult."""
+    try:
+        worker = get_worker_instance()
+        result = worker.process_video(
+            converted_info['converted_video_path'],
+            converted_info['folder'],
+            converted_info['subfolder'],
+            converted_info['original_video_path']
+        )
+        return result
+    except Exception as e:
+        return BatchProcessingResult(
+            file_path=converted_info.get('original_video_path', 'unknown'),
+            folder_name=converted_info.get('folder', 'unknown'),
+            subfolder_name=converted_info.get('subfolder', 'unknown'),
+            processing_time=0.0,
+            success=False,
+            error_message=str(e)
+        )
+    finally:
+        # Clean up temporary file
+        temp_path = converted_info.get('converted_video_path')
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 # PID file path
@@ -452,7 +761,35 @@ def neural_worker_task(converted_info):
             os.remove(video_path)
 
 def process_videos_dual_pipeline(input_dirs, ext, cpu_workers, gpu_workers, ffmpeg_gpu_workers, start_time=None, end_time=None):
-    """Основная функция обработки видео с двумя пайплайнами и поддержкой нескольких папок"""
+    """Enhanced dual pipeline processing with modern architecture integration."""
+    try:
+        # Create modern batch configuration
+        batch_config = ANPRBatchConfig(
+            input_directories=input_dirs,
+            video_extension=ext,
+            cpu_workers=cpu_workers,
+            gpu_workers=gpu_workers,
+            ffmpeg_gpu_workers=ffmpeg_gpu_workers
+        )
+        
+        # Use modern batch processor
+        processor = ModernBatchProcessor()
+        results = processor.process_videos_dual_pipeline(batch_config)
+        
+        return len([r for r in results if r.success])
+        
+    except Exception as e:
+        logger = setup_logging()
+        logger.error(f"Modern batch processing failed, falling back to legacy: {e}")
+        
+        # Fallback to legacy implementation
+        return _legacy_process_videos_dual_pipeline(
+            input_dirs, ext, cpu_workers, gpu_workers, ffmpeg_gpu_workers, start_time, end_time
+        )
+
+
+def _legacy_process_videos_dual_pipeline(input_dirs, ext, cpu_workers, gpu_workers, ffmpeg_gpu_workers, start_time=None, end_time=None):
+    """Legacy dual pipeline processing function (preserved for fallback)."""
     logger = setup_logging()
     global gpu_counter, lock
 

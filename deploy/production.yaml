@@ -1,0 +1,413 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lsr-skud
+  labels:
+    name: lsr-skud
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lsr-skud-config
+  namespace: lsr-skud
+data:
+  # Database configuration
+  DB_PATH: "/app/data/gate_control.db"
+  
+  # Model configuration
+  MODELS_DIR: "/app/models"
+  SNAPSHOTS_DIR: "/app/data/snapshots"
+  
+  # ANPR Batch Processing
+  ANPR_CPU_WORKERS: "8"
+  ANPR_GPU_WORKERS: "4"
+  ANPR_FFMPEG_GPU_WORKERS: "2"
+  ANPR_OUTPUT_CSV_PATH: "/app/data/plates.csv"
+  ANPR_OUTPUT_IMAGES_DIR: "/app/data/snapshots"
+  ANPR_VIDEO_EXTENSION: ".issvd"
+  
+  # Performance settings
+  TORCHSCRIPT_ENABLED: "true"
+  HALF_PRECISION: "true"
+  GPU_ENABLED: "true"
+  
+  # Streamlit configuration
+  STREAMLIT_SERVER_ENABLE_CORS: "false"
+  STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION: "false"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lsr-skud-secrets
+  namespace: lsr-skud
+type: Opaque
+stringData:
+  # Telegram Bot Configuration (if used)
+  TELEGRAM_BOT_TOKEN: ""
+  TELEGRAM_API_ID: ""
+  TELEGRAM_API_HASH: ""
+  
+  # Database credentials (if external DB)
+  DB_USERNAME: ""
+  DB_PASSWORD: ""
+  
+  # Parsec integration credentials
+  PARSEC_BOT_USERNAME: ""
+  PARSEC_BOT_PASSWORD: ""
+  PARSEC_ADMIN_USERNAME: ""
+  PARSEC_ADMIN_PASSWORD: ""
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lsr-skud-data
+  namespace: lsr-skud
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: fast-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lsr-skud-models
+  namespace: lsr-skud
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: fast-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lsr-skud-logs
+  namespace: lsr-skud
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lsr-skud-app
+  namespace: lsr-skud
+  labels:
+    app: lsr-skud
+    component: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: lsr-skud
+      component: web
+  template:
+    metadata:
+      labels:
+        app: lsr-skud
+        component: web
+    spec:
+      containers:
+      - name: lsr-skud
+        image: lsr-skud:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8501
+          name: http
+        
+        envFrom:
+        - configMapRef:
+            name: lsr-skud-config
+        - secretRef:
+            name: lsr-skud-secrets
+        
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+        - name: models
+          mountPath: /app/models
+        - name: logs
+          mountPath: /app/batch_processing/logs
+        - name: video-archive
+          mountPath: /mnt/video_archive
+          readOnly: true
+        
+        livenessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: 8501
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: 8501
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: lsr-skud-data
+      - name: models
+        persistentVolumeClaim:
+          claimName: lsr-skud-models
+      - name: logs
+        persistentVolumeClaim:
+          claimName: lsr-skud-logs
+      - name: video-archive
+        hostPath:
+          path: /mnt/iss_media
+          type: Directory
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lsr-skud-service
+  namespace: lsr-skud
+  labels:
+    app: lsr-skud
+    component: web
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8501
+    targetPort: 8501
+    name: http
+  selector:
+    app: lsr-skud
+    component: web
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lsr-skud-ingress
+  namespace: lsr-skud
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  tls:
+  - hosts:
+    - lsr-skud.example.com
+    secretName: lsr-skud-tls
+  rules:
+  - host: lsr-skud.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: lsr-skud-service
+            port:
+              number: 8501
+
+---
+# GPU-enabled batch processing job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lsr-skud-batch-job
+  namespace: lsr-skud
+  labels:
+    app: lsr-skud
+    component: batch-processor
+spec:
+  ttlSecondsAfterFinished: 86400  # Clean up after 24 hours
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        accelerator: nvidia-tesla-k80  # Adjust for your GPU nodes
+      
+      containers:
+      - name: batch-processor
+        image: lsr-skud:batch-worker
+        
+        envFrom:
+        - configMapRef:
+            name: lsr-skud-config
+        - secretRef:
+            name: lsr-skud-secrets
+        
+        env:
+        - name: ANPR_INPUT_DIRECTORIES
+          value: "/mnt/video_archive/CAM_14,/mnt/video_archive/CAM_16"
+        - name: ANPR_CPU_WORKERS
+          value: "8"
+        - name: ANPR_GPU_WORKERS
+          value: "4"
+        - name: ANPR_FFMPEG_GPU_WORKERS
+          value: "2"
+        
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4000m"
+            nvidia.com/gpu: 2
+          limits:
+            memory: "16Gi"
+            cpu: "8000m"
+            nvidia.com/gpu: 2
+        
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+        - name: models
+          mountPath: /app/models
+        - name: logs
+          mountPath: /app/batch_processing/logs
+        - name: video-archive
+          mountPath: /mnt/video_archive
+          readOnly: true
+      
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: lsr-skud-data
+      - name: models
+        persistentVolumeClaim:
+          claimName: lsr-skud-models
+      - name: logs
+        persistentVolumeClaim:
+          claimName: lsr-skud-logs
+      - name: video-archive
+        hostPath:
+          path: /mnt/iss_media
+          type: Directory
+
+---
+# CronJob for regular batch processing
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lsr-skud-batch-cron
+  namespace: lsr-skud
+  labels:
+    app: lsr-skud
+    component: batch-scheduler
+spec:
+  schedule: "0 2 * * *"  # Run daily at 2 AM
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            accelerator: nvidia-tesla-k80
+          
+          containers:
+          - name: batch-processor
+            image: lsr-skud:batch-worker
+            
+            envFrom:
+            - configMapRef:
+                name: lsr-skud-config
+            - secretRef:
+                name: lsr-skud-secrets
+            
+            env:
+            - name: ANPR_INPUT_DIRECTORIES
+              value: "/mnt/video_archive/CAM_14,/mnt/video_archive/CAM_16,/mnt/video_archive/CAM_18"
+            - name: ANPR_START_TIME
+              value: "$(date -d '1 day ago' +'%Y-%m-%d 00:00:00')"
+            - name: ANPR_END_TIME  
+              value: "$(date -d '1 day ago' +'%Y-%m-%d 23:59:59')"
+            
+            resources:
+              requests:
+                memory: "8Gi"
+                cpu: "4000m"
+                nvidia.com/gpu: 2
+              limits:
+                memory: "16Gi"
+                cpu: "8000m"
+                nvidia.com/gpu: 2
+            
+            volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: models
+              mountPath: /app/models
+            - name: logs
+              mountPath: /app/batch_processing/logs
+            - name: video-archive
+              mountPath: /mnt/video_archive
+              readOnly: true
+          
+          volumes:
+          - name: data
+            persistentVolumeClaim:
+              claimName: lsr-skud-data
+          - name: models
+            persistentVolumeClaim:
+              claimName: lsr-skud-models
+          - name: logs
+            persistentVolumeClaim:
+              claimName: lsr-skud-logs
+          - name: video-archive
+            hostPath:
+              path: /mnt/iss_media
+              type: Directory
+
+---
+# Horizontal Pod Autoscaler for web application
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: lsr-skud-hpa
+  namespace: lsr-skud
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: lsr-skud-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

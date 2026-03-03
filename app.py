@@ -3,15 +3,19 @@ import os
 import sys
 from datetime import datetime, timedelta
 
+# Ensure directories exist
 os.makedirs("data", exist_ok=True)
 os.makedirs("data/snapshots", exist_ok=True)
 os.makedirs("data/training", exist_ok=True)
 os.makedirs("models", exist_ok=True)
+os.makedirs("batch_processing", exist_ok=True)
 
 from db.database import get_db
+from pages.batch_processing import show_batch_processing
+from analytics.batch_analytics import show_batch_analytics
 
 st.set_page_config(
-    page_title="Gate Control System",
+    page_title="LSR SKUD - Gate Control System",
     page_icon="🚗",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -95,11 +99,59 @@ CUSTOM_CSS = """
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-db = get_db()
-stats = db.get_stats()
+def main():
+    """Main application with navigation."""
+    # Sidebar navigation
+    st.sidebar.title("🚗 LSR SKUD")
+    st.sidebar.markdown("### Navigation")
+    
+    page = st.sidebar.selectbox("Choose a page", [
+        "🏠 Dashboard",
+        "📹 Live Recognition", 
+        "🔄 Batch Processing",
+        "👥 User Management",
+        "🎯 Training",
+        "📊 Analytics",
+        "⚙️ Settings"
+    ])
+    
+    # Add system status in sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### System Status")
+    
+    try:
+        db = get_db()
+        stats = db.get_stats()
+        st.sidebar.success(f"✅ Database Connected")
+        st.sidebar.info(f"📊 {stats['total_users']} Users | {stats['active_passes']} Active Passes")
+    except Exception as e:
+        st.sidebar.error("❌ Database Error")
+        st.sidebar.caption(str(e))
+    
+    # Route to appropriate page
+    if page == "🏠 Dashboard":
+        show_dashboard()
+    elif page == "📹 Live Recognition":
+        show_live_recognition()
+    elif page == "🔄 Batch Processing":
+        show_batch_processing()
+    elif page == "👥 User Management":
+        show_user_management()
+    elif page == "🎯 Training":
+        show_training()
+    elif page == "📊 Analytics":
+        show_analytics()
+    elif page == "⚙️ Settings":
+        show_settings()
 
-st.markdown('<div class="main-header">🚗 Gate Control System</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">License Plate Recognition & Access Control Dashboard</div>', unsafe_allow_html=True)
+
+def show_dashboard():
+    """Show main dashboard (original content)."""
+    db = get_db()
+    stats = db.get_stats()
+
+    st.markdown('<div class="main-header">🚗 Gate Control System</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">License Plate Recognition & Access Control Dashboard</div>', unsafe_allow_html=True)
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -222,3 +274,64 @@ if gate_events:
         """, unsafe_allow_html=True)
 else:
     st.info("No gate events yet.")
+
+
+def show_live_recognition():
+    """Show live recognition page."""
+    st.title("📹 Live Recognition")
+    st.info("Live recognition interface - Coming soon")
+    st.markdown("""
+    This page will show:
+    - Real-time camera feeds
+    - Live recognition results
+    - Camera configuration
+    - Recognition pipeline controls
+    """)
+
+
+def show_user_management():
+    """Show user management page."""
+    st.title("👥 User Management")
+    st.info("User management interface - Coming soon")
+    st.markdown("""
+    This page will show:
+    - User registration and editing
+    - Pass management
+    - User permissions
+    - Access logs
+    """)
+
+
+def show_training():
+    """Show training page."""
+    st.title("🎯 Training")
+    st.info("Model training interface - Coming soon")
+    st.markdown("""
+    This page will show:
+    - Training data management
+    - Model training controls
+    - Training progress
+    - Model performance metrics
+    """)
+
+
+def show_analytics():
+    """Show analytics page."""
+    show_batch_analytics()
+
+
+def show_settings():
+    """Show settings page."""
+    st.title("⚙️ Settings")
+    st.info("System settings - Coming soon")
+    st.markdown("""
+    This page will show:
+    - Camera configuration
+    - System preferences
+    - Integration settings
+    - Maintenance tools
+    """)
+
+
+if __name__ == "__main__":
+    main()

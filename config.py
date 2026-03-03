@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 
+from config.anpr_config import ANPRBatchConfig, ANPRDaemonConfig
+
 
 @dataclass
 class CameraConfig:
@@ -50,6 +52,14 @@ class Config:
     default_vehicle_model: str = "yolo26n.pt"
 
     cameras: List[CameraConfig] = field(default_factory=list)
+    
+    # ANPR Batch Processing Configuration
+    anpr_batch: ANPRBatchConfig = field(default_factory=ANPRBatchConfig)
+    anpr_daemon: ANPRDaemonConfig = field(default_factory=ANPRDaemonConfig)
+    
+    # Enhanced models configuration
+    torchscript_enabled: bool = True
+    half_precision: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -77,6 +87,10 @@ class Config:
             gpu_enabled=os.environ.get("GPU_ENABLED", "false").lower() == "true",
             device=os.environ.get("DEVICE", "cpu"),
             min_training_samples=int(os.environ.get("MIN_TRAINING_SAMPLES", "50")),
+            torchscript_enabled=os.environ.get("TORCHSCRIPT_ENABLED", "true").lower() == "true",
+            half_precision=os.environ.get("HALF_PRECISION", "true").lower() == "true",
+            anpr_batch=ANPRBatchConfig.from_env(),
+            anpr_daemon=ANPRDaemonConfig.from_env()
         )
 
         camera_urls = os.environ.get("CAMERA_URLS", "")

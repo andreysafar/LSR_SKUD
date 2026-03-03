@@ -1,0 +1,181 @@
+version: '3.8'
+
+services:
+  # Main LSR_SKUD application
+  lsr-skud:
+    build:
+      context: .
+      target: production
+    image: lsr-skud:latest
+    container_name: lsr-skud-app
+    ports:
+      - "8501:8501"
+    environment:
+      # Database configuration
+      - DB_PATH=/app/data/gate_control.db
+      
+      # Model paths
+      - MODELS_DIR=/app/models
+      - SNAPSHOTS_DIR=/app/data/snapshots
+      
+      # ANPR Batch Processing
+      - ANPR_CPU_WORKERS=4
+      - ANPR_GPU_WORKERS=2
+      - ANPR_FFMPEG_GPU_WORKERS=1
+      - ANPR_OUTPUT_CSV_PATH=/app/data/plates.csv
+      - ANPR_OUTPUT_IMAGES_DIR=/app/data/snapshots
+      
+      # Performance settings
+      - TORCHSCRIPT_ENABLED=true
+      - HALF_PRECISION=true
+      - GPU_ENABLED=false
+      
+      # Monitoring
+      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
+    
+    volumes:
+      # Persistent data
+      - ./data:/app/data
+      - ./models:/app/models
+      
+      # Video archive (read-only)
+      - /mnt/video_archive:/mnt/video_archive:ro
+      
+      # Batch processing outputs
+      - ./batch_processing/logs:/app/batch_processing/logs
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # GPU-enabled variant (uncomment for GPU deployment)
+  # lsr-skud-gpu:
+  #   build:
+  #     context: .
+  #     target: gpu-production
+  #   image: lsr-skud:gpu-latest
+  #   container_name: lsr-skud-gpu-app
+  #   ports:
+  #     - "8501:8501"
+  #   environment:
+  #     - GPU_ENABLED=true
+  #     - ANPR_GPU_WORKERS=4
+  #     - ANPR_FFMPEG_GPU_WORKERS=2
+  #     - CUDA_VISIBLE_DEVICES=all
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./models:/app/models
+  #     - /mnt/video_archive:/mnt/video_archive:ro
+  #   restart: unless-stopped
+
+  # Dedicated batch processing worker
+  batch-worker:
+    build:
+      context: .
+      target: batch-worker
+    image: lsr-skud:batch-worker
+    container_name: lsr-skud-batch-worker
+    environment:
+      # Database configuration  
+      - DB_PATH=/app/data/gate_control.db
+      
+      # Batch processing settings
+      - ANPR_CPU_WORKERS=6
+      - ANPR_GPU_WORKERS=3
+      - ANPR_FFMPEG_GPU_WORKERS=2
+      - ANPR_INPUT_DIRECTORIES=/mnt/video_archive/CAM_14,/mnt/video_archive/CAM_16
+      - ANPR_VIDEO_EXTENSION=.issvd
+      - ANPR_OUTPUT_CSV_PATH=/app/data/batch_plates.csv
+      - ANPR_OUTPUT_IMAGES_DIR=/app/data/snapshots
+      
+      # Performance optimization
+      - TORCHSCRIPT_ENABLED=true
+      - HALF_PRECISION=true
+      - ANPR_FORMAT_CACHE_ENABLED=true
+      - ANPR_TIMEOUT_SECONDS=180
+    
+    volumes:
+      # Shared data with main app
+      - ./data:/app/data
+      - ./models:/app/models
+      
+      # Video archive (read-only)
+      - /mnt/video_archive:/mnt/video_archive:ro
+      
+      # Batch processing logs
+      - ./batch_processing/logs:/app/batch_processing/logs
+    
+    restart: "no"  # Batch jobs should not auto-restart
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: lsr-skud-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Monitoring with Prometheus (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lsr-skud-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Grafana for visualization (optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lsr-skud-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
