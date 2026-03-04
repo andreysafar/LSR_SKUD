@@ -1,3 +1,4 @@
+# Build uses Docker layer cache; run `docker-compose build --no-cache` only when you need a full rebuild.
 version: '3.8'
 
 services:
@@ -6,11 +7,25 @@ services:
     build:
       context: .
       target: production
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     image: lsr-skud:latest
     container_name: lsr-skud-app
     ports:
       - "8501:8501"
     environment:
+      - UV_CACHE_DIR=/app/.cache
+      # Runtime network policy: no proxy for app services.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - NO_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - no_proxy=
+      # Proxy only for Telegram bot (optional)
+      - TELEGRAM_PROXY_URL=${TELEGRAM_PROXY_URL:-}
       # Database configuration
       - DB_PATH=/app/data/gate_control.db
       
@@ -92,9 +107,21 @@ services:
     build:
       context: .
       target: batch-worker
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     image: lsr-skud:batch-worker
     container_name: lsr-skud-batch-worker
     environment:
+      - UV_CACHE_DIR=/app/.cache
+      # Runtime network policy: no proxy for batch worker.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - NO_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - no_proxy=
       # Database configuration  
       - DB_PATH=/app/data/gate_control.db
       
@@ -132,12 +159,13 @@ services:
         max-size: "50m"
         max-file: "5"
 
-  # Redis for caching (optional)
+  # Redis for caching (optional); host port 6380 to avoid conflict with existing Redis on 6379
   redis:
     image: redis:7-alpine
+    pull_policy: if_not_present
     container_name: lsr-skud-redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -151,6 +179,7 @@ services:
   # Monitoring with Prometheus (optional)
   prometheus:
     image: prom/prometheus:latest
+    pull_policy: if_not_present
     container_name: lsr-skud-prometheus
     ports:
       - "9090:9090"
@@ -161,12 +190,13 @@ services:
     profiles:
       - monitoring
 
-  # Grafana for visualization (optional)
+  # Grafana for visualization (optional); host port 3001 if 3000 is already in use
   grafana:
     image: grafana/grafana:latest
+    pull_policy: if_not_present
     container_name: lsr-skud-grafana
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:

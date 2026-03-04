@@ -23,7 +23,10 @@ class Database:
         if self._initialized:
             return
         self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        except OSError:
+            pass
         self._local = threading.local()
         self._init_schema()
         self._initialized = True

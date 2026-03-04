@@ -49,6 +49,7 @@ show_help() {
     echo "  --monitoring  Enable monitoring stack"
     echo "  --batch-only  Deploy batch processing only"
     echo "  --web-only    Deploy web interface only"
+    echo "  --no-build    Skip image build (use existing images; faster when nothing changed)"
     echo "  --dry-run     Show what would be deployed without actually deploying"
     echo "  --help        Show this help message"
     echo ""
@@ -63,6 +64,7 @@ GPU_ENABLED=false
 MONITORING_ENABLED=false
 BATCH_ONLY=false
 WEB_ONLY=false
+SKIP_BUILD=false
 DRY_RUN=false
 
 while [[ $# -gt 1 ]]; do
@@ -81,6 +83,10 @@ while [[ $# -gt 1 ]]; do
             ;;
         --web-only)
             WEB_ONLY=true
+            shift
+            ;;
+        --no-build)
+            SKIP_BUILD=true
             shift
             ;;
         --dry-run)
@@ -162,28 +168,39 @@ check_prerequisites() {
     log_success "Prerequisites check completed"
 }
 
-# Build Docker images
+# Build Docker images (proxy from host is passed into build for apt-get/pip)
 build_images() {
     log_info "Building Docker images..."
     
     cd "$PROJECT_ROOT"
     
+    # Pass proxy to Docker build so apt-get and pip inside container can use it
+    BUILD_ARGS=()
+    for var in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; do
+        [[ -n "${!var}" ]] && BUILD_ARGS+=(--build-arg "$var=${!var}")
+    done
+    if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+        log_info "Using proxy from environment for build"
+    else
+        log_warning "No proxy variables found; apt/pip in docker build may fail in restricted network"
+    fi
+    
     if [[ "$GPU_ENABLED" == "true" ]]; then
         log_info "Building GPU-enabled image..."
         if [[ "$DRY_RUN" == "false" ]]; then
-            docker build --target gpu-production -t lsr-skud:gpu-latest .
+            docker build "${BUILD_ARGS[@]}" --target gpu-production -t lsr-skud:gpu-latest .
         fi
     else
         log_info "Building CPU-only image..."
         if [[ "$DRY_RUN" == "false" ]]; then
-            docker build --target production -t lsr-skud:latest .
+            docker build "${BUILD_ARGS[@]}" --target production -t lsr-skud:latest .
         fi
     fi
     
     # Build batch worker image
     log_info "Building batch worker image..."
     if [[ "$DRY_RUN" == "false" ]]; then
-        docker build --target batch-worker -t lsr-skud:batch-worker .
+        docker build "${BUILD_ARGS[@]}" --target batch-worker -t lsr-skud:batch-worker .
     fi
     
     log_success "Docker images built successfully"
@@ -210,24 +227,24 @@ deploy_docker() {
         return
     fi
     
-    # Stop existing containers
+    # Stop existing containers (same profile so monitoring containers are removed and network refs cleared)
     log_info "Stopping existing containers..."
-    $COMPOSE_CMD down
-    
-    # Start services based on deployment type
+    $COMPOSE_CMD $PROFILES down --remove-orphans
+
+    # Start services based on deployment type (--force-recreate avoids stale network references)
     if [[ "$WEB_ONLY" == "true" ]]; then
         log_info "Starting web interface only..."
         if [[ "$GPU_ENABLED" == "true" ]]; then
-            $COMPOSE_CMD up -d lsr-skud-gpu
+            $COMPOSE_CMD $PROFILES up -d --force-recreate lsr-skud-gpu
         else
-            $COMPOSE_CMD up -d lsr-skud
+            $COMPOSE_CMD $PROFILES up -d --force-recreate lsr-skud
         fi
     elif [[ "$BATCH_ONLY" == "true" ]]; then
         log_info "Starting batch processor only..."
-        $COMPOSE_CMD up -d batch-worker
+        $COMPOSE_CMD $PROFILES up -d --force-recreate batch-worker
     else
         log_info "Starting all services..."
-        $COMPOSE_CMD $PROFILES up -d
+        $COMPOSE_CMD $PROFILES up -d --force-recreate
     fi
     
     # Wait for services to be healthy
@@ -360,14 +377,19 @@ main() {
     log_info "Monitoring: $MONITORING_ENABLED"
     log_info "Batch Only: $BATCH_ONLY"
     log_info "Web Only: $WEB_ONLY"
+    log_info "Skip Build: $SKIP_BUILD"
     log_info "Dry Run: $DRY_RUN"
     echo ""
-    
+
     # Run pre-deployment checks
     check_prerequisites
-    
-    # Build images
-    build_images
+
+    # Build images (skip if --no-build and use existing images)
+    if [[ "$SKIP_BUILD" != "true" ]]; then
+        build_images
+    else
+        log_info "Skipping image build (--no-build)"
+    fi
     
     # Deploy based on environment
     if [[ "$DEPLOYMENT_TYPE" == "kubernetes" ]]; then

@@ -398,7 +398,7 @@ metrics = monitor.get_current_metrics(session_id)
 ```mermaid
 graph TB
     subgraph "Base Images"
-        A[python:3.11-slim]
+        A[python:3.12-slim]
         B[nvidia/cuda:11.8-runtime]
     end
     

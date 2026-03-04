@@ -34,9 +34,10 @@ ENV/
 env.bak/
 venv.bak/
 
-# IDE
+# IDE / editor
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~

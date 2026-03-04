@@ -3,12 +3,12 @@ import os
 import sys
 from datetime import datetime, timedelta
 
-# Ensure directories exist
-os.makedirs("data", exist_ok=True)
-os.makedirs("data/snapshots", exist_ok=True)
-os.makedirs("data/training", exist_ok=True)
-os.makedirs("models", exist_ok=True)
-os.makedirs("batch_processing", exist_ok=True)
+# Ensure directories exist (ignore permission errors on mounted volumes)
+for d in ("data", "data/snapshots", "data/training", "models", "batch_processing"):
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
 
 from db.database import get_db
 from pages.batch_processing import show_batch_processing

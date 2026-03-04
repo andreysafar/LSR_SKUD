@@ -68,8 +68,13 @@ class TelegramBot:
                 ApplicationBuilder, CommandHandler, MessageHandler,
                 CallbackQueryHandler, filters, ContextTypes
             )
+            from telegram.request import HTTPXRequest
 
-            app = ApplicationBuilder().token(self.config.telegram_bot_token).build()
+            builder = ApplicationBuilder().token(self.config.telegram_bot_token)
+            if self.config.telegram_proxy_url:
+                # Proxy is applied only for Telegram API client.
+                builder = builder.request(HTTPXRequest(proxy=self.config.telegram_proxy_url))
+            app = builder.build()
 
             app.add_handler(CommandHandler("start", self._cmd_start))
             app.add_handler(CommandHandler("help", self._cmd_help))

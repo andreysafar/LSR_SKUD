@@ -3,11 +3,15 @@
 from .anpr_config import (
     ANPRBatchConfig,
     ANPRProcessingMetrics,
-    ANPRDaemonConfig
+    ANPRDaemonConfig,
 )
+from .app_config import Config, CameraConfig, get_config
 
 __all__ = [
     "ANPRBatchConfig",
-    "ANPRProcessingMetrics", 
-    "ANPRDaemonConfig"
+    "ANPRProcessingMetrics",
+    "ANPRDaemonConfig",
+    "Config",
+    "CameraConfig",
+    "get_config",
 ]

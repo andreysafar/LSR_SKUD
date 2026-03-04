@@ -1,6 +1,6 @@
 # LSR_SKUD - Advanced License Plate Recognition System
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)
 ![Docker](https://img.shields.io/badge/Docker-Ready-green.svg)
 ![CUDA](https://img.shields.io/badge/CUDA-Supported-orange.svg)
 ![License](https://img.shields.io/badge/License-Proprietary-red.svg)
@@ -75,7 +75,7 @@ graph TB
 
 ### Prerequisites
 
-- **Python 3.11+**
+- **Python 3.12+**
 - **Docker and Docker Compose**
 - **NVIDIA GPU** (optional but recommended)
 - **8GB+ RAM**
