@@ -1,0 +1,274 @@
+# GitLab CI/CD Pipeline для LSR_SKUD
+# Runner: 10.205.111.13:180
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy-dev
+  - deploy-prod
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  REGISTRY_IMAGE: "$CI_REGISTRY_IMAGE"
+
+# ====================================
+# LINT STAGE
+# ====================================
+
+lint:code:
+  stage: lint
+  image: python:3.12-slim
+  script:
+    - pip install uv
+    - uv sync --frozen
+    - echo "Running code quality checks..."
+    - uv run flake8 . --max-line-length=120 --ignore=E203,E266,E501,W503 || true
+    - uv run black --check . || true
+    - uv run mypy . --ignore-missing-imports --no-error-summary || true
+  allow_failure: true
+  only:
+    - dev
+    - main
+    - merge_requests
+    - /^feature\/.*$/
+
+# ====================================
+# TEST STAGE
+# ====================================
+
+test:unit:
+  stage: test
+  image: python:3.12-slim
+  services:
+    - sqlite:latest
+  script:
+    - pip install uv
+    - uv sync --frozen --all-extras
+    - echo "Running unit tests..."
+    - uv run pytest tests/ -v --cov=. --cov-report=xml --cov-report=html || true
+  artifacts:
+    paths:
+      - htmlcov/
+      - coverage.xml
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 30 days
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  allow_failure: true
+  only:
+    - dev
+    - main
+    - merge_requests
+
+# ====================================
+# BUILD STAGE
+# ====================================
+
+build:docker:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $REGISTRY_IMAGE:latest-${CI_COMMIT_REF_SLUG} --target production .
+    - docker build -t $REGISTRY_IMAGE:batch-worker-${CI_COMMIT_REF_SLUG} --target batch-worker .
+    - docker push $REGISTRY_IMAGE:latest-${CI_COMMIT_REF_SLUG}
+    - docker push $REGISTRY_IMAGE:batch-worker-${CI_COMMIT_REF_SLUG}
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        docker tag $REGISTRY_IMAGE:latest-${CI_COMMIT_REF_SLUG} $REGISTRY_IMAGE:latest
+        docker push $REGISTRY_IMAGE:latest
+      fi
+  only:
+    - dev
+    - main
+  retry:
+    max: 2
+    when: runner_system_failure
+
+# ====================================
+# DEPLOY DEV STAGE
+# ====================================
+
+deploy:dev:
+  stage: deploy-dev
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client git
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$DEV_SSH_KEY" > ~/.ssh/deploy_key
+    - chmod 600 ~/.ssh/deploy_key
+    - echo "StrictHostKeyChecking=no" >> ~/.ssh/config
+  script:
+    - echo "🚀 Deploying to DEV environment..."
+    - |
+      ssh -i ~/.ssh/deploy_key -p $DEV_SSH_PORT $DEV_SSH_USER@$DEV_SSH_HOST << 'EOF'
+      set -e
+      
+      cd /home/safar/Project/LSR_SKUD
+      
+      # Update code
+      git fetch origin ${CI_COMMIT_REF_NAME}
+      git checkout ${CI_COMMIT_REF_NAME}
+      git reset --hard origin/${CI_COMMIT_REF_NAME}
+      
+      # Pull images
+      docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+      docker pull $CI_REGISTRY_IMAGE:latest-${CI_COMMIT_REF_SLUG}
+      docker pull $CI_REGISTRY_IMAGE:batch-worker-${CI_COMMIT_REF_SLUG}
+      
+      # Update compose and restart
+      docker compose down || true
+      docker compose up -d
+      
+      # Wait and check health
+      sleep 10
+      docker compose ps
+      docker compose logs --tail=50
+      
+      echo "✅ DEV deployment completed"
+      EOF
+  environment:
+    name: development
+    url: http://$DEV_SSH_HOST:8501
+    auto_stop_in: 1 week
+  only:
+    - dev
+  when: manual
+  retry:
+    max: 1
+
+deploy:dev:auto:
+  extends: deploy:dev
+  when: on_success
+  only:
+    - dev
+  allow_failure: true
+
+# ====================================
+# DEPLOY PROD STAGE
+# ====================================
+
+deploy:prod:
+  stage: deploy-prod
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client git
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$PROD_SSH_KEY" > ~/.ssh/deploy_key
+    - chmod 600 ~/.ssh/deploy_key
+    - echo "StrictHostKeyChecking=no" >> ~/.ssh/config
+  script:
+    - echo "🚀 Deploying to PRODUCTION environment..."
+    - |
+      ssh -i ~/.ssh/deploy_key -p $PROD_SSH_PORT $PROD_SSH_USER@$PROD_SSH_HOST << 'EOF'
+      set -e
+      
+      cd /home/safar/Project/LSR_SKUD
+      
+      # Backup database
+      echo "📦 Backing up database..."
+      mkdir -p backups
+      sqlite3 data/gate_control.db ".backup backups/gate_control_$(date +%Y%m%d_%H%M%S).db"
+      
+      # Update code
+      echo "📥 Fetching latest code..."
+      git fetch origin ${CI_COMMIT_REF_NAME}
+      git checkout ${CI_COMMIT_REF_NAME}
+      git reset --hard origin/${CI_COMMIT_REF_NAME}
+      
+      # Pull images
+      echo "🐳 Pulling Docker images..."
+      docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+      docker pull $CI_REGISTRY_IMAGE:latest-${CI_COMMIT_REF_SLUG}
+      docker pull $CI_REGISTRY_IMAGE:batch-worker-${CI_COMMIT_REF_SLUG}
+      
+      # Update compose and restart
+      echo "🔄 Restarting services..."
+      docker compose down || true
+      docker compose up -d
+      
+      # Health check
+      echo "🏥 Running health checks..."
+      sleep 15
+      for i in {1..10}; do
+        if curl -f http://localhost:8501/_stcore/health; then
+          echo "✅ Health check passed"
+          break
+        fi
+        if [ $i -eq 10 ]; then
+          echo "❌ Health check failed"
+          exit 1
+        fi
+        sleep 2
+      done
+      
+      docker compose ps
+      docker compose logs --tail=100
+      
+      echo "✅ PRODUCTION deployment completed"
+      EOF
+  environment:
+    name: production
+    url: http://$PROD_SSH_HOST:8501
+  only:
+    - main
+  when: manual
+  retry:
+    max: 1
+
+# ====================================
+# NOTIFICATION STAGE (Optional)
+# ====================================
+
+notify:slack:dev:
+  stage: deploy-dev
+  image: alpine:latest
+  script:
+    - |
+      apk add --no-cache curl jq
+      curl -X POST $SLACK_WEBHOOK -H 'Content-type: application/json' \
+        --data "{
+          \"text\": \"LSR_SKUD DEV Deployment\",
+          \"blocks\": [{
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"*LSR_SKUD DEV*\nStatus: ✅ Success\nBranch: ${CI_COMMIT_BRANCH}\nCommit: ${CI_COMMIT_SHORT_SHA}\nAuthor: ${CI_COMMIT_AUTHOR}\"
+            }
+          }]
+        }"
+  only:
+    - dev
+  when: on_success
+  allow_failure: true
+
+notify:slack:prod:
+  stage: deploy-prod
+  image: alpine:latest
+  script:
+    - |
+      apk add --no-cache curl jq
+      curl -X POST $SLACK_WEBHOOK -H 'Content-type: application/json' \
+        --data "{
+          \"text\": \"LSR_SKUD PRODUCTION Deployment\",
+          \"blocks\": [{
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"*LSR_SKUD PRODUCTION*\nStatus: ✅ Success\nBranch: ${CI_COMMIT_BRANCH}\nCommit: ${CI_COMMIT_SHORT_SHA}\nAuthor: ${CI_COMMIT_AUTHOR}\"
+            }
+          }]
+        }"
+  only:
+    - main
+  when: on_success
+  allow_failure: true

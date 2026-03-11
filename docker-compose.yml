@@ -1,8 +1,7 @@
-# Build uses Docker layer cache; run `docker-compose build --no-cache` only when you need a full rebuild.
-version: '3.8'
+# Build uses Docker layer cache; run `docker compose build --no-cache` only when you need a full rebuild.
 
 services:
-  # Main LSR_SKUD application
+  # Main LSR_SKUD application (Streamlit web UI)
   lsr-skud:
     build:
       context: .
@@ -15,92 +14,78 @@ services:
     container_name: lsr-skud-app
     ports:
       - "8501:8501"
+    env_file: .env
     environment:
       - UV_CACHE_DIR=/app/.cache
-      # Runtime network policy: no proxy for app services.
       - HTTP_PROXY=
       - HTTPS_PROXY=
       - NO_PROXY=
       - http_proxy=
       - https_proxy=
       - no_proxy=
-      # Proxy only for Telegram bot (optional)
-      - TELEGRAM_PROXY_URL=${TELEGRAM_PROXY_URL:-}
-      # Database configuration
       - DB_PATH=/app/data/gate_control.db
-      
-      # Model paths
       - MODELS_DIR=/app/models
       - SNAPSHOTS_DIR=/app/data/snapshots
-      
-      # ANPR Batch Processing
-      - ANPR_CPU_WORKERS=4
-      - ANPR_GPU_WORKERS=2
-      - ANPR_FFMPEG_GPU_WORKERS=1
       - ANPR_OUTPUT_CSV_PATH=/app/data/plates.csv
       - ANPR_OUTPUT_IMAGES_DIR=/app/data/snapshots
-      
-      # Performance settings
-      - TORCHSCRIPT_ENABLED=true
-      - HALF_PRECISION=true
-      - GPU_ENABLED=false
-      
-      # Monitoring
       - STREAMLIT_SERVER_ENABLE_CORS=false
       - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
-    
+
     volumes:
-      # Persistent data
       - ./data:/app/data
       - ./models:/app/models
-      
-      # Video archive (read-only)
       - /mnt/video_archive:/mnt/video_archive:ro
-      
-      # Batch processing outputs
       - ./batch_processing/logs:/app/batch_processing/logs
-    
+
     restart: unless-stopped
-    
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
-    
+
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
 
-  # GPU-enabled variant (uncomment for GPU deployment)
-  # lsr-skud-gpu:
-  #   build:
-  #     context: .
-  #     target: gpu-production
-  #   image: lsr-skud:gpu-latest
-  #   container_name: lsr-skud-gpu-app
-  #   ports:
-  #     - "8501:8501"
-  #   environment:
-  #     - GPU_ENABLED=true
-  #     - ANPR_GPU_WORKERS=4
-  #     - ANPR_FFMPEG_GPU_WORKERS=2
-  #     - CUDA_VISIBLE_DEVICES=all
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   volumes:
-  #     - ./data:/app/data
-  #     - ./models:/app/models
-  #     - /mnt/video_archive:/mnt/video_archive:ro
-  #   restart: unless-stopped
+  # Telegram bot + recognition pipeline
+  telegram-bot:
+    image: lsr-skud:latest
+    container_name: lsr-skud-bot
+    runtime: nvidia
+    network_mode: host  # Required for RTSP stream access
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DEVICE=cuda
+      - GPU_ENABLED=true
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - TELEGRAM_PROXY_URL=${TELEGRAM_PROXY_URL:-}
+    depends_on:
+      lsr-skud:
+        condition: service_started
+    env_file: .env
+    command: [".venv/bin/python", "main.py"]
+
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Dedicated batch processing worker
   batch-worker:
@@ -113,46 +98,29 @@ services:
         - NO_PROXY=${NO_PROXY:-}
     image: lsr-skud:batch-worker
     container_name: lsr-skud-batch-worker
+    runtime: nvidia
     environment:
-      - UV_CACHE_DIR=/app/.cache
-      # Runtime network policy: no proxy for batch worker.
-      - HTTP_PROXY=
-      - HTTPS_PROXY=
-      - NO_PROXY=
-      - http_proxy=
-      - https_proxy=
-      - no_proxy=
-      # Database configuration  
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
       - DB_PATH=/app/data/gate_control.db
-      
-      # Batch processing settings
-      - ANPR_CPU_WORKERS=6
-      - ANPR_GPU_WORKERS=3
-      - ANPR_FFMPEG_GPU_WORKERS=2
       - ANPR_INPUT_DIRECTORIES=/mnt/video_archive/CAM_14,/mnt/video_archive/CAM_16
       - ANPR_VIDEO_EXTENSION=.issvd
       - ANPR_OUTPUT_CSV_PATH=/app/data/batch_plates.csv
       - ANPR_OUTPUT_IMAGES_DIR=/app/data/snapshots
-      
-      # Performance optimization
-      - TORCHSCRIPT_ENABLED=true
-      - HALF_PRECISION=true
-      - ANPR_FORMAT_CACHE_ENABLED=true
-      - ANPR_TIMEOUT_SECONDS=180
-    
+      - CUDA_VISIBLE_DEVICES=${BATCH_CUDA_VISIBLE_DEVICES:-1}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DEVICE=cuda
+      - GPU_ENABLED=true
+    env_file: .env
     volumes:
-      # Shared data with main app
       - ./data:/app/data
       - ./models:/app/models
-      
-      # Video archive (read-only)
       - /mnt/video_archive:/mnt/video_archive:ro
-      
-      # Batch processing logs
       - ./batch_processing/logs:/app/batch_processing/logs
-    
-    restart: "no"  # Batch jobs should not auto-restart
-    
+
+    restart: "no"
+
     logging:
       driver: "json-file"
       options:

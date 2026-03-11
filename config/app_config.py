@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from config.anpr_config import ANPRBatchConfig, ANPRDaemonConfig
+from .anpr_config import ANPRBatchConfig, ANPRDaemonConfig
 
 
 @dataclass
@@ -61,22 +61,30 @@ class Config:
     torchscript_enabled: bool = True
     half_precision: bool = True
 
+    @staticmethod
+    def _safe_int(val: str, default: int = 0) -> int:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
     @classmethod
     def from_env(cls) -> "Config":
+        _si = cls._safe_int
         cfg = cls(
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-            telegram_api_id=int(os.environ.get("TELEGRAM_API_ID", "0")),
+            telegram_api_id=_si(os.environ.get("TELEGRAM_API_ID", "0")),
             telegram_api_hash=os.environ.get("TELEGRAM_API_HASH", ""),
             telegram_proxy_url=os.environ.get("TELEGRAM_PROXY_URL", ""),
             parsec_domain=os.environ.get("PARSEC_DOMAIN", ""),
-            parsec_port=int(os.environ.get("PARSEC_PORT", "10101")),
+            parsec_port=_si(os.environ.get("PARSEC_PORT", "10101"), 10101),
             parsec_organization=os.environ.get("PARSEC_ORGANIZATION", "SYSTEM"),
             parsec_bot_username=os.environ.get("PARSEC_BOT_USERNAME", ""),
             parsec_bot_password=os.environ.get("PARSEC_BOT_PASSWORD", ""),
             parsec_admin_username=os.environ.get("PARSEC_ADMIN_USERNAME", ""),
             parsec_admin_password=os.environ.get("PARSEC_ADMIN_PASSWORD", ""),
-            admin_chat_id=int(os.environ.get("ADMIN_CHAT_ID", "0")),
-            tech_chat_id=int(os.environ.get("TECH_CHAT_ID", "0")),
+            admin_chat_id=_si(os.environ.get("ADMIN_CHAT_ID", "0")),
+            tech_chat_id=_si(os.environ.get("TECH_CHAT_ID", "0")),
             db_path=os.environ.get("DB_PATH", "data/gate_control.db"),
             models_dir=os.environ.get("MODELS_DIR", "models"),
             training_data_dir=os.environ.get("TRAINING_DATA_DIR", "data/training"),
@@ -87,7 +95,7 @@ class Config:
             confidence_ocr=float(os.environ.get("CONFIDENCE_OCR", "0.4")),
             gpu_enabled=os.environ.get("GPU_ENABLED", "false").lower() == "true",
             device=os.environ.get("DEVICE", "cpu"),
-            min_training_samples=int(os.environ.get("MIN_TRAINING_SAMPLES", "50")),
+            min_training_samples=_si(os.environ.get("MIN_TRAINING_SAMPLES", "50"), 50),
             torchscript_enabled=os.environ.get("TORCHSCRIPT_ENABLED", "true").lower() == "true",
             half_precision=os.environ.get("HALF_PRECISION", "true").lower() == "true",
             anpr_batch=ANPRBatchConfig.from_env(),

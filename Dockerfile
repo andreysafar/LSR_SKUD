@@ -83,6 +83,7 @@ ENV http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= NO_PROXY=
 # Create non-root user for security (home and .cache so uv can write)
 RUN groupadd -r lsrskud && useradd -r -g lsrskud -d /home/lsrskud lsrskud \
     && mkdir -p /home/lsrskud/.cache \
+    && chmod 777 /home/lsrskud/.cache \
     && chown -R lsrskud:lsrskud /home/lsrskud
 ENV HOME=/home/lsrskud
 
@@ -111,6 +112,9 @@ RUN mkdir -p data/snapshots \
 # Switch to non-root user
 USER lsrskud
 
+ENV UV_NO_CACHE=1 \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+
 # Expose port
 EXPOSE 8501
 
@@ -119,7 +123,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
 # Default command
-CMD ["uv", "run", "streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD [".venv/bin/python", "main.py"]
 
 
 # GPU-enabled production stage

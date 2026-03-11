@@ -1,9 +1,8 @@
 import streamlit as st
+
 from db.database import get_db
 
-st.set_page_config(page_title="Gate Events", page_icon="🚪", layout="wide")
-
-st.markdown("""
+GATE_CSS = """
 <style>
     .gate-success {
         background: #d5f5e3;
@@ -30,36 +29,42 @@ st.markdown("""
         display: inline-block;
     }
 </style>
-""", unsafe_allow_html=True)
+"""
 
-db = get_db()
 
-st.title("🚪 Gate Events")
-st.markdown("Track all gate open/close events and pass matches.")
+def show_gate_events():
+    """Gate events page."""
+    st.markdown(GATE_CSS, unsafe_allow_html=True)
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    cameras = db.get_cameras()
-    cam_options = ["All cameras"] + [f"{c['name']} ({c['camera_id']})" for c in cameras]
-    cam_filter = st.selectbox("Filter by camera", cam_options)
-with col2:
-    limit = st.selectbox("Show events", [25, 50, 100, 200], index=1)
+    db = get_db()
 
-cam_id = None
-if cam_filter != "All cameras" and cameras:
-    for c in cameras:
-        if c["camera_id"] in cam_filter:
-            cam_id = c["camera_id"]
-            break
+    st.title("🚪 Gate Events")
+    st.markdown("Track all gate open/close events and pass matches.")
 
-events = db.get_gate_events(limit=limit, camera_id=cam_id)
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        cameras = db.get_cameras()
+        cam_options = ["All cameras"] + [f"{c['name']} ({c['camera_id']})" for c in cameras]
+        cam_filter = st.selectbox("Filter by camera", cam_options)
+    with col2:
+        limit = st.selectbox("Show events", [25, 50, 100, 200], index=1)
 
-st.markdown(f"**{len(events)}** gate events")
-st.markdown("---")
+    cam_id = None
+    if cam_filter != "All cameras" and cameras:
+        for c in cameras:
+            if c["camera_id"] in cam_filter:
+                cam_id = c["camera_id"]
+                break
 
-if not events:
-    st.info("No gate events recorded yet. Events appear when the recognition pipeline matches a plate to an active pass.")
-else:
+    events = db.get_gate_events(limit=limit, camera_id=cam_id)
+
+    st.markdown(f"**{len(events)}** gate events")
+    st.markdown("---")
+
+    if not events:
+        st.info("No gate events recorded yet.")
+        return
+
     success_count = sum(1 for e in events if e.get("success"))
     fail_count = len(events) - success_count
 
@@ -74,16 +79,19 @@ else:
         success = ev.get("success", 0)
         card_class = "gate-success" if success else "gate-fail"
         icon = "✅" if success else "❌"
+        details_html = ""
+        if ev.get("details"):
+            details_html = f"<br><small style='color:#777;margin-left:2rem;'>{ev['details']}</small>"
+        pass_html = f" | Pass #{ev['pass_id']}" if ev.get("pass_id") else ""
 
         st.markdown(f"""
         <div class="{card_class}">
             {icon} <span class="plate-display">{ev.get('plate_number', '—')}</span>
-            <span style="margin-left: 1rem; color: #555;">
+            <span style="margin-left:1rem;color:#555;">
                 📷 {ev.get('camera_id', '—')} |
                 ⏰ {ev.get('timestamp', '—')} |
-                Action: {ev.get('action', '—')}
-                {f" | Pass #{ev['pass_id']}" if ev.get('pass_id') else ""}
+                Action: {ev.get('action', '—')}{pass_html}
             </span>
-            {f"<br><small style='color: #777; margin-left: 2rem;'>{ev.get('details', '')}</small>" if ev.get('details') else ""}
+            {details_html}
         </div>
         """, unsafe_allow_html=True)

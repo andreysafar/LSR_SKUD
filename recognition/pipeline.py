@@ -98,7 +98,7 @@ class RecognitionPipeline:
 
     def add_camera(self, camera_id: str, stream_url: str, name: str = "",
                    mask_path: str = ""):
-        self.camera_manager.add_camera(camera_id, stream_url, name)
+        self.camera_manager.add_camera(camera_id, stream_url, name, mask_path)
         self.detectors[camera_id] = CameraDetectors(camera_id, self.config)
 
     def set_result_callback(self, callback: Callable):
@@ -141,7 +141,7 @@ class RecognitionPipeline:
         result.timestamp = datetime.now().isoformat()
 
         cam = self.camera_manager.cameras.get(camera_id)
-        if cam and hasattr(cam, 'mask_path') and cam.mask_path:
+        if cam and cam.mask_path:
             frame = cam.apply_mask(frame, cam.mask_path)
 
         vehicle = det.vehicle_detector.detect(frame)

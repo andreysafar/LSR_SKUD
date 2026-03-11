@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 # Disable ultralytics online checks to speed up import
 os.environ['YOLO_VERBOSE'] = 'False'
 os.environ['ULTRALYTICS_OFFLINE'] = 'True'
+os.environ['EASYOCR_OFFLINE'] = '1'
 
 from ultralytics import YOLO
 import cv2
@@ -115,7 +116,7 @@ class ModernAnalysisWorker:
                 ['en'], 
                 model_storage_directory=self.weight_directory, 
                 gpu=self.config.gpu_enabled and torch.cuda.is_available(), 
-                download_enabled=True
+                download_enabled=False  # Use offline mode to prevent hanging
             )
         except Exception as e:
             self.logger.error(f"Error loading OCR reader: {e}")
@@ -146,7 +147,7 @@ class ModernAnalysisWorker:
     def _load_ocr_reader(self):
         print("Loading OCR reader...")
         try:
-            return easyocr.Reader(['en'], model_storage_directory=self.weight_directory, gpu=torch.cuda.is_available(), download_enabled=True)
+            return easyocr.Reader(['en'], model_storage_directory=self.weight_directory, gpu=torch.cuda.is_available(), download_enabled=False)
         except Exception as e:
             print(f"Error loading OCR reader: {e}")
             raise
@@ -185,14 +186,16 @@ class ModernAnalysisWorker:
             try:
                 ocr_result = self.reader.readtext(cropped_image)
                 if ocr_result:
-                    return ocr_result[0][1], (x1, y1, x2, y2)
+                    text = ocr_result[0][1]
+                    confidence = ocr_result[0][2]
+                    return text, (x1, y1, x2, y2), confidence
             except Exception as e:
                 print(f"OCR failed for a frame: {e}")
-        return None, None
+        return None, None, None
 
     def process_vehicle_plate(self, vehicle_plate):
-        plate_text, plate_box = self.number_plate_detection(vehicle_plate)
-        return plate_text, plate_box, vehicle_plate
+        plate_text, plate_box, confidence = self.number_plate_detection(vehicle_plate)
+        return plate_text, plate_box, confidence, vehicle_plate
 
     def process_video(self, video_path: str, folder_name: str, subfolder_name: str, 
                       original_video_path: Optional[str] = None) -> BatchProcessingResult:
@@ -256,10 +259,9 @@ class ModernAnalysisWorker:
                             futures.append(executor.submit(self.process_vehicle_plate, vehicle_plate))
 
                         for future in futures:
-                            plate_text, plate_box, vehicle_crop = future.result()
-                            if plate_text and plate_box:
-                                # Determine confidence (this would ideally come from the detection)
-                                confidence = np.random.uniform(0.7, 0.95)  # Placeholder
+                            plate_text, plate_box, confidence, vehicle_crop = future.result()
+                            if plate_text and plate_box and confidence:
+                                # Use real confidence from OCR
                                 
                                 if confidence > best_confidence:
                                     # Save the best detection

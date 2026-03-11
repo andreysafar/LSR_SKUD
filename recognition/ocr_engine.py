@@ -36,8 +36,15 @@ class OCREngine:
             return
         try:
             import easyocr
-            self.reader = easyocr.Reader(self.languages, gpu=self.gpu)
-            logger.info(f"OCR engine loaded (gpu={self.gpu})")
+            import os
+            # Use offline mode to prevent hanging on network requests
+            self.reader = easyocr.Reader(
+                self.languages, 
+                gpu=self.gpu,
+                model_storage_directory=os.path.abspath("models"),
+                download_enabled=False
+            )
+            logger.info(f"OCR engine loaded (gpu={self.gpu}, offline mode)")
             self._loaded = True
         except ImportError:
             logger.warning("easyocr not available, using simulation mode")

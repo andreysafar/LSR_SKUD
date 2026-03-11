@@ -5,6 +5,7 @@ import tempfile
 import sys
 import signal
 import atexit
+import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 import time
@@ -13,13 +14,18 @@ import queue
 import json
 import logging
 from multiprocessing import Manager
+from typing import Optional, List, Dict, Any
 import torch
 
-# Import the refactored worker class
-from .neural_worker import ModernAnalysisWorker, init_modern_neural_worker, get_worker_instance
-from config import Config, get_config
-from config.anpr_config import ANPRBatchConfig
+from config import Config, get_config, ANPRBatchConfig
 from db import get_db, ANPRDatabaseIntegration, BatchProcessingResult
+
+try:
+    from .neural_worker import ModernAnalysisWorker, init_modern_neural_worker, get_worker_instance
+except ImportError:
+    ModernAnalysisWorker = None
+    init_modern_neural_worker = None
+    get_worker_instance = None
 
 # Global variable to hold the worker instance for each process
 worker = None
@@ -525,13 +531,17 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 def init_neural_worker():
     """
-    Initializer for each neural worker process. Creates a single AnalysisWorker instance.
+    Initializer for each neural worker process. Creates a single worker instance.
     """
     global worker
     pid = os.getpid()
     print(f"[GPU-PID:{pid}] Initializing neural worker...")
     t0 = time.time()
-    worker = AnalysisWorker()
+    if init_modern_neural_worker is not None:
+        init_modern_neural_worker(get_config())
+        worker = get_worker_instance()
+    else:
+        raise RuntimeError("Neural worker module not available")
     t1 = time.time()
     print(f"[GPU-PID:{pid}] Neural worker initialized in {t1-t0:.1f} sec")
     if t1-t0 > 30:
