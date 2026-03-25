@@ -10,24 +10,56 @@ VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 class VehicleDetector:
     def __init__(self, weights_path: str = "models/yolo26n.pt",
-                 device: str = "cpu", confidence: float = 0.5):
+                 device: str = "cpu", confidence: float = 0.5,
+                 tensorrt_enabled: bool = True):
         self.weights_path = weights_path
         self.device = device
         self.confidence = confidence
+        self.tensorrt_enabled = tensorrt_enabled
         self.model = None
         self._loaded = False
+
+    def _get_engine_path(self, pt_path: str) -> str:
+        """Путь к TensorRT engine файлу."""
+        return pt_path.rsplit(".", 1)[0] + ".engine"
+
+    def _try_load_tensorrt(self, pt_path: str):
+        """Попытка загрузить TensorRT engine, при отсутствии — export из .pt."""
+        engine_path = self._get_engine_path(pt_path)
+        if os.path.exists(engine_path):
+            from ultralytics import YOLO
+            self.model = YOLO(engine_path)
+            logger.info(f"Vehicle detector loaded (TensorRT): {engine_path}")
+            return True
+        # Попытка export
+        try:
+            from ultralytics import YOLO
+            model = YOLO(pt_path)
+            model.export(format="engine", half=True, device=self.device)
+            if os.path.exists(engine_path):
+                self.model = YOLO(engine_path)
+                logger.info(f"Vehicle detector exported to TensorRT: {engine_path}")
+                return True
+        except Exception as e:
+            logger.warning(f"TensorRT export failed, falling back to .pt: {e}")
+        return False
 
     def load(self):
         if self._loaded:
             return
         try:
             from ultralytics import YOLO
-            if os.path.exists(self.weights_path):
-                self.model = YOLO(self.weights_path)
-                logger.info(f"Vehicle detector loaded: {self.weights_path}")
-            else:
-                self.model = YOLO("yolo26n.pt")
-                logger.info("Vehicle detector loaded with default yolo26n.pt")
+            weights = self.weights_path if os.path.exists(self.weights_path) else "yolo26n.pt"
+
+            # TensorRT → TorchScript → .pt
+            if self.tensorrt_enabled and self.device != "cpu":
+                if self._try_load_tensorrt(weights):
+                    self._loaded = True
+                    return
+
+            # Fallback: стандартная загрузка .pt
+            self.model = YOLO(weights)
+            logger.info(f"Vehicle detector loaded: {weights}")
             self._loaded = True
         except ImportError:
             logger.warning("ultralytics not available, using simulation mode")

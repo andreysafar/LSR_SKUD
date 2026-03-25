@@ -36,6 +36,9 @@ def plate_to_hex_code(plate: str) -> str:
     return hex_str
 
 
+LOADING_DURATION_MIN = 40  # Разовый пропуск на погрузку/разгрузку
+
+
 class PassHandler:
     def __init__(self, db, parsec_api):
         self.db = db
@@ -43,26 +46,30 @@ class PassHandler:
 
     def _compute_validity(self, duration: str):
         now = datetime.now()
-        if duration == "day_end":
+        if duration == "loading":
+            valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
+            valid_to = (now + timedelta(minutes=LOADING_DURATION_MIN)).strftime("%Y-%m-%d %H:%M:%S")
+            duration_text = f"разовый на {LOADING_DURATION_MIN} мин"
+        elif duration == "day_end":
             valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
             valid_to = now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%d %H:%M:%S")
-            duration_text = "until end of day"
+            duration_text = "до конца дня"
         elif duration == "3hours":
             valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
             valid_to = (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
-            duration_text = "for 3 hours"
+            duration_text = "на 3 часа"
         elif duration == "24hours":
             valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
             valid_to = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-            duration_text = "for 24 hours"
+            duration_text = "на 24 часа"
         elif duration == "week":
             valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
             valid_to = (now + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-            duration_text = "for 1 week"
+            duration_text = "на 1 неделю"
         else:
             valid_from = now.strftime("%Y-%m-%d %H:%M:%S")
             valid_to = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-            duration_text = "for 24 hours"
+            duration_text = "на 24 часа"
         return valid_from, valid_to, duration_text
 
     def create_vehicle_pass(self, user_id: int, plate_number: str,
@@ -129,6 +136,177 @@ class PassHandler:
         result["pass_data"] = pass_data
         logger.info(f"Vehicle pass created: user={user_id}, plate={plate_clean}")
         return result
+
+    def create_loading_pass(self, user_id: int, plate_number: str,
+                            access_group_id: str = None) -> Dict:
+        """Разовый пропуск на погрузку/разгрузку (40 мин, без м/м)."""
+        result = {"success": False, "message": "", "pass_data": None}
+
+        plate_clean = normalize_plate_input(plate_number)
+        if not plate_clean:
+            result["message"] = "Некорректный номер т/с"
+            return result
+
+        user = self.db.get_user(user_id)
+        if not user:
+            result["message"] = "Пользователь не авторизован"
+            return result
+
+        # Проверка чёрного списка (Parsec BlockPerson)
+        if user.get("parsec_person_id") and self.parsec and self.parsec.host:
+            if self._is_blocked(user["parsec_person_id"]):
+                result["message"] = ("Вы находитесь в чёрном списке. "
+                                     "Создание пропусков невозможно. Обратитесь в УК.")
+                return result
+
+        valid_from, valid_to, duration_text = self._compute_validity("loading")
+
+        parsec_identifier_code = None
+        if self.parsec and self.parsec.host and access_group_id:
+            try:
+                session_data = self.parsec.open_admin_session()
+                if session_data:
+                    session_id = session_data["session_id"]
+                    plate_code = self.parsec.get_unique_card_code(session_id) or secrets.token_hex(4).upper()
+                    vehicle_id = self.parsec.create_vehicle(
+                        session_id, plate_number=plate_clean,
+                        org_id=session_data.get("root_org_unit_id"),
+                    )
+                    if vehicle_id:
+                        success = self.parsec.add_vehicle_plate_identifier(
+                            session_id, vehicle_id, access_group_id,
+                            plate_code=plate_code, name=plate_clean,
+                            valid_from=valid_from, valid_to=valid_to,
+                        )
+                        if success:
+                            parsec_identifier_code = plate_code
+                    self.parsec.close_session(session_id)
+            except Exception as e:
+                logger.error(f"Parsec loading pass creation failed: {e}")
+
+        pass_data = self.db.create_pass_extended(
+            user_id=user_id,
+            pass_type="vehicle",
+            plate_number=plate_clean,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            pass_subtype="loading",
+            max_duration_min=LOADING_DURATION_MIN,
+            owner_parsec_id=user.get("parsec_person_id"),
+            access_group_id=access_group_id or user.get("default_access_group"),
+            parsec_pass_id=parsec_identifier_code,
+        )
+
+        result["success"] = True
+        result["message"] = (f"Разовый пропуск на погрузку создан для {plate_clean} "
+                             f"({duration_text})")
+        result["pass_data"] = pass_data
+        logger.info(f"Loading pass created: user={user_id}, plate={plate_clean}")
+        return result
+
+    def create_guest_pass(self, user_id: int, plate_number: str,
+                           parking_spot_id: int,
+                           access_group_id: str = None,
+                           duration: str = "day_end",
+                           driver_phone: str = None,
+                           vehicle_brand: str = None) -> Dict:
+        """Гостевой пропуск с указанием м/м."""
+        result = {"success": False, "message": "", "pass_data": None}
+
+        plate_clean = normalize_plate_input(plate_number)
+        if not plate_clean:
+            result["message"] = "Некорректный номер т/с"
+            return result
+
+        user = self.db.get_user(user_id)
+        if not user:
+            result["message"] = "Пользователь не авторизован"
+            return result
+
+        # Проверка чёрного списка
+        if user.get("parsec_person_id") and self.parsec and self.parsec.host:
+            if self._is_blocked(user["parsec_person_id"]):
+                result["message"] = ("Вы находитесь в чёрном списке. "
+                                     "Создание пропусков невозможно. Обратитесь в УК.")
+                return result
+
+        # Валидация м/м: принадлежит ли собственнику
+        spots = self.db.get_parking_spots(owner_user_id=user_id)
+        spot_ids = [s["id"] for s in spots]
+        if parking_spot_id not in spot_ids:
+            # Попробуем по parsec_person_id
+            if user.get("parsec_person_id"):
+                spots_parsec = self.db.get_parking_spots(owner_parsec_id=user["parsec_person_id"])
+                spot_ids = [s["id"] for s in spots_parsec]
+            if parking_spot_id not in spot_ids:
+                result["message"] = "Указанное м/м не принадлежит вам"
+                return result
+
+        valid_from, valid_to, duration_text = self._compute_validity(duration)
+
+        parsec_identifier_code = None
+        if self.parsec and self.parsec.host and access_group_id:
+            try:
+                session_data = self.parsec.open_admin_session()
+                if session_data:
+                    session_id = session_data["session_id"]
+                    plate_code = self.parsec.get_unique_card_code(session_id) or secrets.token_hex(4).upper()
+                    vehicle_id = self.parsec.create_vehicle(
+                        session_id, plate_number=plate_clean,
+                        model=vehicle_brand or "",
+                        org_id=session_data.get("root_org_unit_id"),
+                    )
+                    if vehicle_id:
+                        success = self.parsec.add_vehicle_plate_identifier(
+                            session_id, vehicle_id, access_group_id,
+                            plate_code=plate_code, name=plate_clean,
+                            valid_from=valid_from, valid_to=valid_to,
+                        )
+                        if success:
+                            parsec_identifier_code = plate_code
+                    self.parsec.close_session(session_id)
+            except Exception as e:
+                logger.error(f"Parsec guest pass creation failed: {e}")
+
+        pass_data = self.db.create_pass_extended(
+            user_id=user_id,
+            pass_type="vehicle",
+            plate_number=plate_clean,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            pass_subtype="guest",
+            parking_spot_id=parking_spot_id,
+            driver_phone=driver_phone,
+            vehicle_brand=vehicle_brand,
+            owner_parsec_id=user.get("parsec_person_id"),
+            access_group_id=access_group_id or user.get("default_access_group"),
+            parsec_pass_id=parsec_identifier_code,
+        )
+
+        result["success"] = True
+        result["message"] = (f"Гостевой пропуск создан для {plate_clean} "
+                             f"({duration_text})")
+        result["pass_data"] = pass_data
+        logger.info(f"Guest pass created: user={user_id}, plate={plate_clean}, spot={parking_spot_id}")
+        return result
+
+    def _is_blocked(self, parsec_person_id: str) -> bool:
+        """Проверка, заблокирован ли пользователь в Parsec."""
+        # Проверяем локальный счётчик нарушений
+        total_violations = self.db.get_violation_count(parsec_person_id)
+        if total_violations >= 2:
+            return True
+        return False
+
+    def get_user_parking_spots(self, user_id: int) -> List[Dict]:
+        """Получить м/м пользователя для выбора при создании гостевого пропуска."""
+        user = self.db.get_user(user_id)
+        if not user:
+            return []
+        spots = self.db.get_parking_spots(owner_user_id=user_id)
+        if not spots and user.get("parsec_person_id"):
+            spots = self.db.get_parking_spots(owner_parsec_id=user["parsec_person_id"])
+        return spots
 
     def create_access_pass(self, user_id: int, access_group_id: str,
                             access_group_name: str = "",

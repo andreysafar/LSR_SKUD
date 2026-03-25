@@ -161,13 +161,111 @@ class Database:
                     FOREIGN KEY (pass_id) REFERENCES passes(id)
                 );
 
+                -- Машиноместа (Parsec не знает о м/м)
+                CREATE TABLE IF NOT EXISTS parking_spots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    spot_number TEXT NOT NULL UNIQUE,
+                    owner_parsec_id TEXT,
+                    owner_user_id INTEGER,
+                    level TEXT,
+                    section TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (owner_user_id) REFERENCES users(user_id)
+                );
+
+                -- Парный журнал въезда/выезда
+                CREATE TABLE IF NOT EXISTS entry_exit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plate_number TEXT NOT NULL,
+                    tag_code TEXT,
+                    entry_camera_id TEXT,
+                    entry_time TEXT,
+                    exit_camera_id TEXT,
+                    exit_time TEXT,
+                    duration_minutes REAL,
+                    pass_id INTEGER,
+                    pass_subtype TEXT,
+                    owner_parsec_id TEXT,
+                    owner_user_id INTEGER,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (entry_camera_id) REFERENCES cameras(camera_id),
+                    FOREIGN KEY (exit_camera_id) REFERENCES cameras(camera_id),
+                    FOREIGN KEY (pass_id) REFERENCES passes(id)
+                );
+
+                -- Инциденты
+                CREATE TABLE IF NOT EXISTS incidents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    incident_type TEXT NOT NULL,
+                    description TEXT,
+                    plate_number TEXT,
+                    apartment TEXT,
+                    pass_id INTEGER,
+                    entry_exit_id INTEGER,
+                    reported_by_user_id INTEGER,
+                    reported_by_role TEXT,
+                    resolved_at TEXT,
+                    resolution TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (pass_id) REFERENCES passes(id),
+                    FOREIGN KEY (entry_exit_id) REFERENCES entry_exit_log(id),
+                    FOREIGN KEY (reported_by_user_id) REFERENCES users(user_id)
+                );
+
+                -- Счётчик нарушений (для авто-блокировки)
+                CREATE TABLE IF NOT EXISTS violation_counts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_parsec_id TEXT NOT NULL,
+                    owner_user_id INTEGER,
+                    violation_type TEXT NOT NULL,
+                    count INTEGER DEFAULT 1,
+                    last_violation_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(owner_parsec_id, violation_type)
+                );
+
+                -- Расширение cameras: направление (entry/exit/both)
+                -- SQLite ALTER TABLE поддерживает только ADD COLUMN
+
+                -- Индексы для новых таблиц
                 CREATE INDEX IF NOT EXISTS idx_passes_plate ON passes(plate_number);
                 CREATE INDEX IF NOT EXISTS idx_passes_status ON passes(status);
                 CREATE INDEX IF NOT EXISTS idx_recognition_camera ON recognition_events(camera_id);
                 CREATE INDEX IF NOT EXISTS idx_recognition_plate ON recognition_events(final_plate);
                 CREATE INDEX IF NOT EXISTS idx_training_camera_stage ON training_samples(camera_id, stage);
                 CREATE INDEX IF NOT EXISTS idx_gate_events_plate ON gate_events(plate_number);
+                CREATE INDEX IF NOT EXISTS idx_entry_exit_plate ON entry_exit_log(plate_number);
+                CREATE INDEX IF NOT EXISTS idx_entry_exit_open ON entry_exit_log(plate_number, exit_time);
+                CREATE INDEX IF NOT EXISTS idx_entry_exit_owner ON entry_exit_log(owner_parsec_id, exit_time);
+                CREATE INDEX IF NOT EXISTS idx_incidents_type ON incidents(incident_type);
+                CREATE INDEX IF NOT EXISTS idx_incidents_plate ON incidents(plate_number);
+                CREATE INDEX IF NOT EXISTS idx_parking_spots_owner ON parking_spots(owner_parsec_id);
+                CREATE INDEX IF NOT EXISTS idx_violation_counts_owner ON violation_counts(owner_parsec_id);
             """)
+
+            # Миграции: добавление новых столбцов к существующим таблицам
+            self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection):
+        """Добавление новых столбцов к существующим таблицам (безопасная миграция)."""
+        migrations = [
+            # passes: подтип пропуска, м/м, телефон водителя, марка, макс. длительность
+            ("passes", "pass_subtype", "TEXT DEFAULT 'regular'"),
+            ("passes", "parking_spot_id", "INTEGER"),
+            ("passes", "driver_phone", "TEXT"),
+            ("passes", "vehicle_brand", "TEXT"),
+            ("passes", "max_duration_min", "INTEGER"),
+            ("passes", "owner_parsec_id", "TEXT"),
+            # cameras: направление камеры (entry/exit/both)
+            ("cameras", "direction", "TEXT DEFAULT 'both'"),
+            # cameras: тип распознавания (gpu/parsec_native)
+            ("cameras", "recognition_type", "TEXT DEFAULT 'gpu'"),
+        ]
+        for table, column, col_type in migrations:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # Столбец уже существует
 
     def save_user(self, user_id: int, phone_number: str = None,
                   parsec_person_id: str = None, full_name: str = None) -> Dict:
@@ -427,6 +525,253 @@ class Database:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
+    # --- Parking spots ---
+
+    def save_parking_spot(self, spot_number: str, owner_parsec_id: str = None,
+                          owner_user_id: int = None, level: str = None,
+                          section: str = None) -> Dict:
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT INTO parking_spots (spot_number, owner_parsec_id, owner_user_id, level, section)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(spot_number) DO UPDATE SET
+                    owner_parsec_id = COALESCE(excluded.owner_parsec_id, owner_parsec_id),
+                    owner_user_id = COALESCE(excluded.owner_user_id, owner_user_id),
+                    level = COALESCE(excluded.level, level),
+                    section = COALESCE(excluded.section, section)
+            """, (spot_number, owner_parsec_id, owner_user_id, level, section))
+            row = conn.execute("SELECT * FROM parking_spots WHERE spot_number = ?", (spot_number,)).fetchone()
+            return dict(row) if row else {}
+
+    def get_parking_spots(self, owner_parsec_id: str = None,
+                          owner_user_id: int = None) -> List[Dict]:
+        with self.get_connection() as conn:
+            if owner_parsec_id:
+                rows = conn.execute(
+                    "SELECT * FROM parking_spots WHERE owner_parsec_id = ? AND is_active = 1",
+                    (owner_parsec_id,)
+                ).fetchall()
+            elif owner_user_id:
+                rows = conn.execute(
+                    "SELECT * FROM parking_spots WHERE owner_user_id = ? AND is_active = 1",
+                    (owner_user_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM parking_spots WHERE is_active = 1").fetchall()
+            return [dict(r) for r in rows]
+
+    def get_parking_spots_count(self, owner_parsec_id: str) -> int:
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM parking_spots WHERE owner_parsec_id = ? AND is_active = 1",
+                (owner_parsec_id,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    # --- Entry/Exit log ---
+
+    def record_entry(self, plate_number: str, camera_id: str,
+                     pass_id: int = None, pass_subtype: str = None,
+                     tag_code: str = None, owner_parsec_id: str = None,
+                     owner_user_id: int = None) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO entry_exit_log (plate_number, entry_camera_id, entry_time,
+                    pass_id, pass_subtype, tag_code, owner_parsec_id, owner_user_id)
+                VALUES (?, ?, datetime('now'), ?, ?, ?, ?, ?)
+            """, (plate_number, camera_id, pass_id, pass_subtype,
+                  tag_code, owner_parsec_id, owner_user_id))
+            return cursor.lastrowid
+
+    def record_exit(self, plate_number: str, camera_id: str) -> Optional[Dict]:
+        with self.get_connection() as conn:
+            plate_clean = plate_number.upper().replace(" ", "")
+            row = conn.execute("""
+                SELECT * FROM entry_exit_log
+                WHERE UPPER(REPLACE(plate_number, ' ', '')) = ?
+                AND exit_time IS NULL
+                ORDER BY entry_time DESC LIMIT 1
+            """, (plate_clean,)).fetchone()
+            if row:
+                conn.execute("""
+                    UPDATE entry_exit_log SET
+                        exit_camera_id = ?,
+                        exit_time = datetime('now'),
+                        duration_minutes = ROUND(
+                            (julianday('now') - julianday(entry_time)) * 24 * 60, 1
+                        )
+                    WHERE id = ?
+                """, (camera_id, row["id"]))
+                updated = conn.execute(
+                    "SELECT * FROM entry_exit_log WHERE id = ?", (row["id"],)
+                ).fetchone()
+                return dict(updated) if updated else None
+            return None
+
+    def get_vehicles_on_premises(self, owner_parsec_id: str = None) -> List[Dict]:
+        """Т/С, которые сейчас на территории (entry есть, exit нет)."""
+        with self.get_connection() as conn:
+            if owner_parsec_id:
+                rows = conn.execute("""
+                    SELECT * FROM entry_exit_log
+                    WHERE owner_parsec_id = ? AND exit_time IS NULL
+                    ORDER BY entry_time DESC
+                """, (owner_parsec_id,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM entry_exit_log
+                    WHERE exit_time IS NULL
+                    ORDER BY entry_time DESC
+                """).fetchall()
+            return [dict(r) for r in rows]
+
+    def count_vehicles_on_premises(self, owner_parsec_id: str) -> int:
+        with self.get_connection() as conn:
+            row = conn.execute("""
+                SELECT COUNT(*) FROM entry_exit_log
+                WHERE owner_parsec_id = ? AND exit_time IS NULL
+            """, (owner_parsec_id,)).fetchone()
+            return row[0] if row else 0
+
+    def get_entry_exit_log(self, limit: int = 50, plate_filter: str = None,
+                           date_from: str = None, date_to: str = None) -> List[Dict]:
+        with self.get_connection() as conn:
+            sql = "SELECT * FROM entry_exit_log WHERE 1=1"
+            params = []
+            if plate_filter:
+                sql += " AND plate_number LIKE ?"
+                params.append(f"%{plate_filter}%")
+            if date_from:
+                sql += " AND entry_time >= ?"
+                params.append(date_from)
+            if date_to:
+                sql += " AND entry_time <= ?"
+                params.append(date_to)
+            sql += " ORDER BY entry_time DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    # --- Incidents ---
+
+    def create_incident(self, incident_type: str, description: str = None,
+                        plate_number: str = None, apartment: str = None,
+                        pass_id: int = None, entry_exit_id: int = None,
+                        reported_by_user_id: int = None,
+                        reported_by_role: str = None) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO incidents (incident_type, description, plate_number,
+                    apartment, pass_id, entry_exit_id, reported_by_user_id, reported_by_role)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (incident_type, description, plate_number, apartment,
+                  pass_id, entry_exit_id, reported_by_user_id, reported_by_role))
+            return cursor.lastrowid
+
+    def get_incidents(self, limit: int = 50, incident_type: str = None,
+                      resolved: bool = None) -> List[Dict]:
+        with self.get_connection() as conn:
+            sql = "SELECT * FROM incidents WHERE 1=1"
+            params = []
+            if incident_type:
+                sql += " AND incident_type = ?"
+                params.append(incident_type)
+            if resolved is True:
+                sql += " AND resolved_at IS NOT NULL"
+            elif resolved is False:
+                sql += " AND resolved_at IS NULL"
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def resolve_incident(self, incident_id: int, resolution: str) -> bool:
+        with self.get_connection() as conn:
+            conn.execute("""
+                UPDATE incidents SET resolved_at = datetime('now'), resolution = ?
+                WHERE id = ?
+            """, (resolution, incident_id))
+            return True
+
+    # --- Violation counts ---
+
+    def increment_violation(self, owner_parsec_id: str, violation_type: str,
+                            owner_user_id: int = None) -> int:
+        """Инкремент счётчика нарушений. Возвращает новое значение count."""
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT INTO violation_counts (owner_parsec_id, owner_user_id, violation_type, count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(owner_parsec_id, violation_type) DO UPDATE SET
+                    count = count + 1,
+                    last_violation_at = datetime('now')
+            """, (owner_parsec_id, owner_user_id, violation_type))
+            row = conn.execute("""
+                SELECT count FROM violation_counts
+                WHERE owner_parsec_id = ? AND violation_type = ?
+            """, (owner_parsec_id, violation_type)).fetchone()
+            return row[0] if row else 1
+
+    def get_violation_count(self, owner_parsec_id: str,
+                            violation_type: str = None) -> int:
+        with self.get_connection() as conn:
+            if violation_type:
+                row = conn.execute("""
+                    SELECT count FROM violation_counts
+                    WHERE owner_parsec_id = ? AND violation_type = ?
+                """, (owner_parsec_id, violation_type)).fetchone()
+                return row[0] if row else 0
+            else:
+                row = conn.execute("""
+                    SELECT SUM(count) FROM violation_counts
+                    WHERE owner_parsec_id = ?
+                """, (owner_parsec_id,)).fetchone()
+                return row[0] if row else 0
+
+    # --- Extended pass creation ---
+
+    def create_pass_extended(self, user_id: int, pass_type: str,
+                             valid_from: str, valid_to: str,
+                             plate_number: str = None,
+                             pass_subtype: str = 'regular',
+                             parking_spot_id: int = None,
+                             driver_phone: str = None,
+                             vehicle_brand: str = None,
+                             max_duration_min: int = None,
+                             owner_parsec_id: str = None,
+                             access_group_id: str = None,
+                             access_group_name: str = None,
+                             parsec_pass_id: str = None) -> Dict:
+        with self.get_connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO passes (user_id, pass_type, plate_number, access_group_id,
+                    access_group_name, valid_from, valid_to, parsec_pass_id,
+                    pass_subtype, parking_spot_id, driver_phone, vehicle_brand,
+                    max_duration_min, owner_parsec_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, pass_type, plate_number, access_group_id,
+                  access_group_name, valid_from, valid_to, parsec_pass_id,
+                  pass_subtype, parking_spot_id, driver_phone, vehicle_brand,
+                  max_duration_min, owner_parsec_id))
+            row = conn.execute("SELECT * FROM passes WHERE id = ?", (cursor.lastrowid,)).fetchone()
+            return dict(row) if row else {}
+
+    def get_active_passes_by_subtype(self, subtype: str = None,
+                                      user_id: int = None) -> List[Dict]:
+        with self.get_connection() as conn:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sql = "SELECT * FROM passes WHERE status = 'active' AND valid_to > ?"
+            params = [now]
+            if subtype:
+                sql += " AND pass_subtype = ?"
+                params.append(subtype)
+            if user_id:
+                sql += " AND user_id = ?"
+                params.append(user_id)
+            sql += " ORDER BY created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
     def get_stats(self) -> Dict:
         with self.get_connection() as conn:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -451,6 +796,20 @@ class Database:
                 ).fetchone()[0],
                 "pending_reviews": conn.execute(
                     "SELECT COUNT(*) FROM recognition_events WHERE admin_reviewed=0 AND vehicle_detected=1"
+                ).fetchone()[0],
+                "vehicles_on_premises": conn.execute(
+                    "SELECT COUNT(*) FROM entry_exit_log WHERE exit_time IS NULL"
+                ).fetchone()[0],
+                "loading_passes_active": conn.execute(
+                    "SELECT COUNT(*) FROM passes WHERE pass_subtype='loading' AND status='active' AND valid_to > ?",
+                    (now,)
+                ).fetchone()[0],
+                "guest_passes_active": conn.execute(
+                    "SELECT COUNT(*) FROM passes WHERE pass_subtype='guest' AND status='active' AND valid_to > ?",
+                    (now,)
+                ).fetchone()[0],
+                "incidents_unresolved": conn.execute(
+                    "SELECT COUNT(*) FROM incidents WHERE resolved_at IS NULL"
                 ).fetchone()[0],
                 "training_samples": {},
             }

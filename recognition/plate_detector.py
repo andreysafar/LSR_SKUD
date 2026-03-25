@@ -8,23 +8,54 @@ logger = logging.getLogger(__name__)
 
 class PlateDetector:
     def __init__(self, weights_path: str = "models/license_plate_detector.pt",
-                 device: str = "cpu", confidence: float = 0.5):
+                 device: str = "cpu", confidence: float = 0.5,
+                 tensorrt_enabled: bool = True):
         self.weights_path = weights_path
         self.device = device
         self.confidence = confidence
+        self.tensorrt_enabled = tensorrt_enabled
         self.model = None
         self._loaded = False
+
+    def _get_engine_path(self, pt_path: str) -> str:
+        return pt_path.rsplit(".", 1)[0] + ".engine"
+
+    def _try_load_tensorrt(self, pt_path: str):
+        engine_path = self._get_engine_path(pt_path)
+        if os.path.exists(engine_path):
+            from ultralytics import YOLO
+            self.model = YOLO(engine_path)
+            logger.info(f"Plate detector loaded (TensorRT): {engine_path}")
+            return True
+        try:
+            from ultralytics import YOLO
+            model = YOLO(pt_path)
+            model.export(format="engine", half=True, device=self.device)
+            if os.path.exists(engine_path):
+                self.model = YOLO(engine_path)
+                logger.info(f"Plate detector exported to TensorRT: {engine_path}")
+                return True
+        except Exception as e:
+            logger.warning(f"TensorRT export failed for plate detector: {e}")
+        return False
 
     def load(self):
         if self._loaded:
             return
         try:
             from ultralytics import YOLO
-            if os.path.exists(self.weights_path):
-                self.model = YOLO(self.weights_path)
-                logger.info(f"Plate detector loaded: {self.weights_path}")
-            else:
+            if not os.path.exists(self.weights_path):
                 logger.warning(f"Plate detector weights not found: {self.weights_path}")
+                self._loaded = True
+                return
+
+            if self.tensorrt_enabled and self.device != "cpu":
+                if self._try_load_tensorrt(self.weights_path):
+                    self._loaded = True
+                    return
+
+            self.model = YOLO(self.weights_path)
+            logger.info(f"Plate detector loaded: {self.weights_path}")
             self._loaded = True
         except ImportError:
             logger.warning("ultralytics not available, using simulation mode")

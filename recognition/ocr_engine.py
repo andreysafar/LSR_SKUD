@@ -1,7 +1,7 @@
 import logging
 import re
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -94,3 +94,23 @@ class OCREngine:
             logger.error(f"OCR error: {e}")
 
         return result
+
+    def recognize_batch(self, plate_images: List[np.ndarray]) -> List[Dict[str, Any]]:
+        """Батчинг: распознавание нескольких номерных табличек за раз.
+        Эффективнее чем поштучный вызов recognize() для нескольких камер."""
+        results = []
+        if not plate_images:
+            return results
+
+        if not self._loaded:
+            self.load()
+
+        if self.reader is None:
+            return [{"text": "", "confidence": 0.0, "raw_text": "",
+                      "normalized": "", "is_valid_ru": False}
+                    for _ in plate_images]
+
+        for plate_image in plate_images:
+            results.append(self.recognize(plate_image))
+
+        return results
