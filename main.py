@@ -76,6 +76,7 @@ def run_recognition_pipeline():
         "confidence_plate": config.confidence_plate,
         "confidence_ocr": config.confidence_ocr,
         "recognition_interval": config.recognition_interval,
+        "tensorrt_enabled": config.tensorrt_enabled,
     }
 
     pipeline = RecognitionPipeline(pipeline_config)

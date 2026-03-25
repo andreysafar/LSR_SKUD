@@ -10,6 +10,7 @@ from recognition.vehicle_detector import VehicleDetector
 from recognition.plate_detector import PlateDetector
 from recognition.ocr_engine import OCREngine
 from recognition.camera_manager import CameraManager
+from recognition.plate_tracker import PlateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class RecognitionResult:
         self.ocr_confidence = 0.0
         self.normalized_plate = ""
         self.is_valid_ru = False
+        self.is_duplicate: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -88,6 +90,10 @@ class CameraDetectors:
             gpu=config.get("gpu_enabled", False),
             confidence=config.get("confidence_ocr", 0.4)
         )
+        self.plate_tracker = PlateTracker(
+            cooldown_seconds=config.get("plate_cooldown_seconds", 30.0),
+            vote_threshold=config.get("plate_vote_threshold", 2),
+        )
 
     def load_all(self):
         self.vehicle_detector.load()
@@ -107,9 +113,12 @@ class RecognitionPipeline:
         self.snapshots_dir = config.get("snapshots_dir", "data/snapshots")
         os.makedirs(self.snapshots_dir, exist_ok=True)
         # Shared OCR engine singleton for cross-camera batching
+        ocr_backend = config.get("ocr_backend", "easyocr")
         self.shared_ocr = OCREngine(
-            gpu=config.get("gpu_enabled", False),
-            confidence=config.get("confidence_ocr", 0.4),
+            languages=config.get("ocr_languages", ["en"]),
+            gpu=config.get("gpu", False),
+            confidence=config.get("ocr_confidence", 0.4),
+            backend=ocr_backend,
         )
 
     def add_camera(self, camera_id: str, stream_url: str, name: str = "",
@@ -121,12 +130,31 @@ class RecognitionPipeline:
     def set_result_callback(self, callback: Callable):
         self._on_result_callback = callback
 
+    def _cleanup_trackers(self):
+        """Cleanup stale plate tracks across all cameras."""
+        for camera_id, det in self.detectors.items():
+            det.plate_tracker.cleanup(max_age_seconds=300.0)
+
+    def _cleanup_timer_loop(self):
+        """Periodic cleanup thread: runs every 60 seconds while pipeline is active."""
+        while self._running:
+            time.sleep(60)
+            if self._running:
+                try:
+                    self._cleanup_trackers()
+                except Exception as e:
+                    logger.error(f"Plate tracker cleanup error: {e}")
+
     def start(self):
         self._running = True
         self.camera_manager.set_frame_callback(self._on_frame)
         for det in self.detectors.values():
             det.load_all()
         self.camera_manager.start()
+        cleanup_thread = threading.Thread(
+            target=self._cleanup_timer_loop, daemon=True, name="plate-tracker-cleanup"
+        )
+        cleanup_thread.start()
         logger.info("Recognition pipeline started")
 
     def stop(self):
@@ -203,6 +231,22 @@ class RecognitionPipeline:
             result.ocr_confidence = ocr["confidence"]
             result.normalized_plate = ocr["normalized"]
             result.is_valid_ru = ocr["is_valid_ru"]
+
+            if result.normalized_plate:
+                track_result = det.plate_tracker.update(
+                    result.normalized_plate, result.ocr_confidence
+                )
+
+                if not track_result["is_new_event"]:
+                    # Duplicate detection within cooldown - skip gate trigger
+                    logger.debug(
+                        f"Plate {result.normalized_plate} duplicate suppressed "
+                        f"(camera {camera_id})"
+                    )
+                    result.is_duplicate = True
+                else:
+                    # Use best reading from tracker for improved accuracy
+                    result.normalized_plate = track_result["best_plate"]
 
         return result
 

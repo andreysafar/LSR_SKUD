@@ -27,22 +27,44 @@ class VehicleDetector:
         """Попытка загрузить TensorRT engine, при отсутствии — export из .pt."""
         engine_path = self._get_engine_path(pt_path)
         if os.path.exists(engine_path):
-            from ultralytics import YOLO
-            self.model = YOLO(engine_path)
-            logger.info(f"Vehicle detector loaded (TensorRT): {engine_path}")
-            return True
+            try:
+                from ultralytics import YOLO
+                self.model = YOLO(engine_path)
+                logger.info(f"Vehicle detector loaded (TensorRT): {engine_path}")
+                return True
+            except Exception as e:
+                logger.warning(f"Vehicle detector: failed to load existing TensorRT engine '{engine_path}': {e}")
+                return False
         # Попытка export
         try:
+            import tensorrt  # noqa: F401 — verify TensorRT is installed before attempting export
+        except ImportError:
+            logger.warning(
+                "Vehicle detector: 'tensorrt' package not found — skipping TensorRT export, "
+                "falling back to .pt model."
+            )
+            return False
+        try:
             from ultralytics import YOLO
+            logger.info(
+                f"Vehicle detector: starting TensorRT export for '{pt_path}' "
+                f"(this may take several minutes on first run) …"
+            )
             model = YOLO(pt_path)
             dev = int(self.device.split(":")[-1]) if "cuda" in str(self.device) else 0
             model.export(format="engine", half=True, device=dev)
             if os.path.exists(engine_path):
                 self.model = YOLO(engine_path)
-                logger.info(f"Vehicle detector exported to TensorRT: {engine_path}")
+                logger.info(f"Vehicle detector exported and loaded (TensorRT): {engine_path}")
                 return True
+            logger.warning(
+                f"Vehicle detector: TensorRT export completed but engine file not found at '{engine_path}'. "
+                "Falling back to .pt model."
+            )
         except Exception as e:
-            logger.warning(f"TensorRT export failed, falling back to .pt: {e}")
+            logger.warning(
+                f"Vehicle detector: TensorRT export failed — falling back to .pt model. Error: {e}"
+            )
         return False
 
     def load(self):

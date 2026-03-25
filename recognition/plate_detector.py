@@ -23,21 +23,44 @@ class PlateDetector:
     def _try_load_tensorrt(self, pt_path: str):
         engine_path = self._get_engine_path(pt_path)
         if os.path.exists(engine_path):
-            from ultralytics import YOLO
-            self.model = YOLO(engine_path)
-            logger.info(f"Plate detector loaded (TensorRT): {engine_path}")
-            return True
+            try:
+                from ultralytics import YOLO
+                self.model = YOLO(engine_path)
+                logger.info(f"Plate detector loaded (TensorRT): {engine_path}")
+                return True
+            except Exception as e:
+                logger.warning(f"Plate detector: failed to load existing TensorRT engine '{engine_path}': {e}")
+                return False
+        # Verify TensorRT package is available before attempting export
+        try:
+            import tensorrt  # noqa: F401
+        except ImportError:
+            logger.warning(
+                "Plate detector: 'tensorrt' package not found — skipping TensorRT export, "
+                "falling back to .pt model."
+            )
+            return False
         try:
             from ultralytics import YOLO
+            logger.info(
+                f"Plate detector: starting TensorRT export for '{pt_path}' "
+                f"(this may take several minutes on first run) …"
+            )
             model = YOLO(pt_path)
             dev = int(self.device.split(":")[-1]) if "cuda" in str(self.device) else 0
             model.export(format="engine", half=True, device=dev)
             if os.path.exists(engine_path):
                 self.model = YOLO(engine_path)
-                logger.info(f"Plate detector exported to TensorRT: {engine_path}")
+                logger.info(f"Plate detector exported and loaded (TensorRT): {engine_path}")
                 return True
+            logger.warning(
+                f"Plate detector: TensorRT export completed but engine file not found at '{engine_path}'. "
+                "Falling back to .pt model."
+            )
         except Exception as e:
-            logger.warning(f"TensorRT export failed for plate detector: {e}")
+            logger.warning(
+                f"Plate detector: TensorRT export failed — falling back to .pt model. Error: {e}"
+            )
         return False
 
     def load(self):

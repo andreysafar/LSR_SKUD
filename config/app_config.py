@@ -60,6 +60,10 @@ class Config:
 
     torchscript_enabled: bool = True
     half_precision: bool = True
+    tensorrt_enabled: bool = True
+
+    guard_chat_id: Optional[int] = None
+    uk_chat_id: Optional[int] = None
 
     @staticmethod
     def _safe_int(val: str, default: int = 0) -> int:
@@ -98,6 +102,9 @@ class Config:
             min_training_samples=_si(os.environ.get("MIN_TRAINING_SAMPLES", "50"), 50),
             torchscript_enabled=os.environ.get("TORCHSCRIPT_ENABLED", "true").lower() == "true",
             half_precision=os.environ.get("HALF_PRECISION", "true").lower() == "true",
+            tensorrt_enabled=os.environ.get("TENSORRT_ENABLED", "true").lower() == "true",
+            guard_chat_id=_si(os.environ.get("GUARD_CHAT_ID", ""), 0) or None,
+            uk_chat_id=_si(os.environ.get("UK_CHAT_ID", ""), 0) or None,
             anpr_batch=ANPRBatchConfig.from_env(),
             anpr_daemon=ANPRDaemonConfig.from_env(),
         )
