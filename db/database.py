@@ -659,6 +659,19 @@ class Database:
             """, (owner_parsec_id,)).fetchone()
             return row[0] if row else 0
 
+    def get_entry_exit_by_id(self, record_id: int) -> Optional[Dict]:
+        """Get entry/exit record by ID."""
+        try:
+            with self.get_connection() as conn:
+                row = conn.execute(
+                    "SELECT * FROM entry_exit_log WHERE id = ?", (record_id,)
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"get_entry_exit_by_id error: {e}")
+            return None
+
     def get_entry_exit_log(self, limit: int = 50, plate_filter: str = None,
                            date_from: str = None, date_to: str = None) -> List[Dict]:
         with self.get_connection() as conn:
@@ -754,6 +767,61 @@ class Database:
                     WHERE owner_parsec_id = ?
                 """, (owner_parsec_id,)).fetchone()
                 return (row[0] or 0) if row else 0
+
+    def get_blacklisted_users(self, limit: int = 50) -> List[Dict]:
+        """Список нарушителей из чёрного списка (count >= 2)."""
+        with self.get_connection() as conn:
+            rows = conn.execute("""
+                SELECT vc.owner_parsec_id, vc.owner_user_id, vc.violation_type,
+                       vc.count, vc.last_violation_at,
+                       u.full_name, u.phone_number
+                FROM violation_counts vc
+                LEFT JOIN users u ON vc.owner_user_id = u.user_id
+                WHERE vc.count >= 2
+                ORDER BY vc.last_violation_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def add_to_blacklist(self, owner_parsec_id: str, owner_user_id: int = None,
+                         violation_type: str = "manual") -> bool:
+        """Добавить в чёрный список (count = max(существующий, 2))."""
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT INTO violation_counts
+                    (owner_parsec_id, owner_user_id, violation_type, count, last_violation_at)
+                VALUES (?, ?, ?, 2, datetime('now'))
+                ON CONFLICT(owner_parsec_id, violation_type) DO UPDATE SET
+                    count = MAX(count, 2),
+                    last_violation_at = datetime('now'),
+                    owner_user_id = COALESCE(excluded.owner_user_id, owner_user_id)
+            """, (owner_parsec_id, owner_user_id, violation_type))
+            return True
+
+    def remove_from_blacklist(self, owner_parsec_id: str,
+                              violation_type: str = None) -> int:
+        """Удалить из чёрного списка. Возвращает количество удалённых строк."""
+        with self.get_connection() as conn:
+            if violation_type:
+                cursor = conn.execute("""
+                    DELETE FROM violation_counts
+                    WHERE owner_parsec_id = ? AND violation_type = ?
+                """, (owner_parsec_id, violation_type))
+            else:
+                cursor = conn.execute("""
+                    DELETE FROM violation_counts
+                    WHERE owner_parsec_id = ?
+                """, (owner_parsec_id,))
+            return cursor.rowcount
+
+    def get_user_by_parsec_id(self, parsec_person_id: str) -> Optional[Dict]:
+        """Поиск пользователя по parsec_person_id."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE parsec_person_id = ?",
+                (parsec_person_id,)
+            ).fetchone()
+            return dict(row) if row else None
 
     # --- Extended pass creation ---
 

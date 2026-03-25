@@ -22,12 +22,14 @@ class NotificationScheduler:
     """Планировщик уведомлений на APScheduler."""
 
     def __init__(self, send_message_callback: Callable = None,
-                 guard_chat_id: int = None, uk_chat_id: int = None):
+                 guard_chat_id: int = None, uk_chat_id: int = None,
+                 parsec_api=None):
         self._scheduler = AsyncIOScheduler()
         self.send_message = send_message_callback
         self.guard_chat_id = guard_chat_id
         self.uk_chat_id = uk_chat_id
         self.db = get_db()
+        self.parsec = parsec_api
 
     def start(self):
         """Запуск планировщика."""
@@ -193,6 +195,47 @@ class NotificationScheduler:
             except Exception:
                 pass
 
+    async def handle_violation(self, owner_parsec_id: str, owner_user_id: int,
+                               violation_type: str, description: str):
+        """Handle a violation: increment counter, notify, auto-block on 2nd offense."""
+        count = self.db.increment_violation(
+            owner_parsec_id, violation_type, owner_user_id=owner_user_id
+        )
+
+        if count == 1:
+            # First violation - warning
+            await self._send_notification(
+                owner_user_id,
+                f"Предупреждение! {description}\n"
+                f"При повторном нарушении вы будете добавлены в чёрный список."
+            )
+        elif count >= 2:
+            # Second violation - blacklist
+            await self._send_notification(
+                owner_user_id,
+                f"Повторное нарушение: {description}\n"
+                f"Вы добавлены в чёрный список. Создание пропусков заблокировано. "
+                f"Обратитесь в УК."
+            )
+            # Auto-block in Parsec
+            if self.parsec:
+                try:
+                    session_id = self.parsec.get_bot_session_id()
+                    if session_id:
+                        self.parsec.block_person(session_id, owner_parsec_id)
+                        logger.info(f"Auto-blocked {owner_parsec_id} after violation #{count}")
+                except Exception as e:
+                    logger.error(f"Failed to auto-block: {e}")
+            # Notify guard
+            if self.guard_chat_id:
+                await self._send_notification(
+                    self.guard_chat_id,
+                    f"Автоблокировка: нарушитель {owner_parsec_id} "
+                    f"добавлен в ЧС ({violation_type}, нарушение #{count})"
+                )
+
+        return count
+
     # --- Внутренние методы ---
 
     async def _notify_loading_expiring(self, owner_user_id: int,
@@ -239,6 +282,15 @@ class NotificationScheduler:
                         "Повторное нарушение! Вы добавлены в чёрный список. "
                         "Создание пропусков заблокировано. Обратитесь в УК."
                     )
+                    # Auto-block in Parsec
+                    if self.parsec:
+                        try:
+                            session_id = self.parsec.get_bot_session_id()
+                            if session_id:
+                                self.parsec.block_person(session_id, user["parsec_person_id"])
+                                logger.info(f"Auto-blocked person {user['parsec_person_id']} after 2nd violation")
+                        except Exception as e:
+                            logger.error(f"Failed to auto-block person: {e}")
 
     async def _send_notification(self, chat_id: int, text: str):
         if self.send_message:

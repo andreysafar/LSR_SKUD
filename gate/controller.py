@@ -9,10 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 class GateController:
-    def __init__(self, parsec_api: Optional[ParsecAPI] = None):
+    def __init__(self, parsec_api: Optional[ParsecAPI] = None, notification_scheduler=None):
         self.parsec = parsec_api
         self.db = get_db()
         self._session_id = None
+        self.notification_scheduler = notification_scheduler
 
     def _ensure_session(self) -> Optional[str]:
         if self._session_id:
@@ -68,7 +69,9 @@ class GateController:
                 success=False,
                 details="No active pass"
             )
-            # Запись для уведомления "въезд без пропуска" (обрабатывается в notifications)
+            # Notify about unauthorized entry
+            if self.notification_scheduler:
+                self.notification_scheduler.notify_unauthorized_entry(plate_clean, camera_id)
             return result
 
         result["pass_found"] = True
@@ -99,6 +102,15 @@ class GateController:
                     success=False,
                     details="Parking limit exceeded"
                 )
+                # Notify about parking limit exceeded
+                if self.notification_scheduler and owner_parsec_id:
+                    user = self.db.get_user_by_parsec_id(owner_parsec_id) if hasattr(self.db, 'get_user_by_parsec_id') else None
+                    owner_name = user.get("full_name", owner_parsec_id) if user else str(owner_parsec_id)
+                    vehicles_count = self.db.count_vehicles_on_premises(owner_parsec_id)
+                    spots_count = self.db.get_parking_spots_count(owner_parsec_id)
+                    self.notification_scheduler.notify_parking_limit_exceeded(
+                        owner_name, plate_clean, vehicles_count, spots_count
+                    )
                 return result
 
         # Открытие ворот: Parsec принимает решение
@@ -136,6 +148,26 @@ class GateController:
                 camera_id, plate_clean, direction, active_pass
             )
             result["entry_exit_id"] = entry_exit_id
+
+        # Notify owner about guest arrival/departure
+        if self.notification_scheduler and result["gate_opened"] and result.get("entry_exit_id"):
+            try:
+                active_pass_data = active_pass
+                if active_pass_data.get("pass_subtype") == "guest":
+                    owner_user_id = active_pass_data.get("user_id")
+                    if owner_user_id and actual_direction == "entry":
+                        spot_id = active_pass_data.get("parking_spot_id", "")
+                        self.notification_scheduler.schedule_guest_arrival_notification(
+                            owner_user_id, plate_clean, str(spot_id) if spot_id else ""
+                        )
+                    elif owner_user_id and actual_direction == "exit":
+                        entry_exit = self.db.get_entry_exit_by_id(result["entry_exit_id"]) if hasattr(self.db, 'get_entry_exit_by_id') else None
+                        duration = entry_exit.get("duration_minutes") if entry_exit else None
+                        self.notification_scheduler.schedule_guest_departure_notification(
+                            owner_user_id, plate_clean, duration
+                        )
+            except Exception as e:
+                logger.error(f"Failed to send guest notification: {e}")
 
         # Обновление recognition event
         if event_id:
