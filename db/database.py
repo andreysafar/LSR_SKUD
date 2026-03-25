@@ -241,10 +241,9 @@ class Database:
                 )
             """)
 
-            # Indexes
+            # Indexes (on columns that exist in the base schema)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_passes_plate ON passes(plate_number)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_passes_status ON passes(status)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_passes_subtype ON passes(pass_subtype)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_recognition_camera ON recognition_events(camera_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_recognition_plate ON recognition_events(final_plate)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_training_camera_stage ON training_samples(camera_id, stage)")
@@ -261,6 +260,9 @@ class Database:
 
             # Миграции: добавление новых столбцов к существующим таблицам
             self._migrate_schema(conn)
+
+            # Indexes on migrated columns (must come after _migrate_schema)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_passes_subtype ON passes(pass_subtype)")
 
     def _migrate_schema(self, conn: sqlite3.Connection):
         """Добавление новых столбцов к существующим таблицам (безопасная миграция)."""
