@@ -51,6 +51,7 @@ class OCREngine:
             self._loaded = True
         except Exception as e:
             logger.error(f"Failed to load OCR engine: {e}")
+            self._loaded = True
 
     def recognize(self, plate_image: np.ndarray) -> Dict[str, Any]:
         result = {
@@ -96,8 +97,15 @@ class OCREngine:
         return result
 
     def recognize_batch(self, plate_images: List[np.ndarray]) -> List[Dict[str, Any]]:
-        """Батчинг: распознавание нескольких номерных табличек за раз.
-        Эффективнее чем поштучный вызов recognize() для нескольких камер."""
+        """Распознавание нескольких номерных табличек.
+
+        NOTE: Currently processes images sequentially by calling recognize()
+        in a loop. There is no GPU-level batching — performance is equivalent
+        to calling recognize() individually for each image.
+
+        # TODO: implement true GPU batching via easyocr's native batch API
+        #       or a custom batched inference pipeline for better throughput.
+        """
         results = []
         if not plate_images:
             return results

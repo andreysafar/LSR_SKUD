@@ -52,7 +52,8 @@ class RecognitionResult:
 
 
 class CameraDetectors:
-    def __init__(self, camera_id: str, config: Dict[str, Any]):
+    def __init__(self, camera_id: str, config: Dict[str, Any],
+                 shared_ocr: Optional[OCREngine] = None):
         self.camera_id = camera_id
         weights_dir = config.get("models_dir", "models")
         cam_weights_v = os.path.join(weights_dir, f"{camera_id}_vehicle.pt")
@@ -61,19 +62,29 @@ class CameraDetectors:
         vehicle_weights = cam_weights_v if os.path.exists(cam_weights_v) else config.get("weights_vehicle", "models/yolo26n.pt")
         plate_weights = cam_weights_p if os.path.exists(cam_weights_p) else config.get("weights_plate", "models/license_plate_detector.pt")
 
+        if not os.path.exists(cam_weights_v):
+            logger.warning(f"Per-camera vehicle weights not found for {camera_id}, "
+                           f"falling back to default: {vehicle_weights}")
+        if not os.path.exists(cam_weights_p):
+            logger.warning(f"Per-camera plate weights not found for {camera_id}, "
+                           f"falling back to default: {plate_weights}")
+
         device = config.get("device", "cpu")
+        tensorrt_enabled = config.get("tensorrt_enabled", True)
 
         self.vehicle_detector = VehicleDetector(
             weights_path=vehicle_weights,
             device=device,
-            confidence=config.get("confidence_vehicle", 0.5)
+            confidence=config.get("confidence_vehicle", 0.5),
+            tensorrt_enabled=tensorrt_enabled,
         )
         self.plate_detector = PlateDetector(
             weights_path=plate_weights,
             device=device,
-            confidence=config.get("confidence_plate", 0.5)
+            confidence=config.get("confidence_plate", 0.5),
+            tensorrt_enabled=tensorrt_enabled,
         )
-        self.ocr_engine = OCREngine(
+        self.ocr_engine = shared_ocr or OCREngine(
             gpu=config.get("gpu_enabled", False),
             confidence=config.get("confidence_ocr", 0.4)
         )
@@ -95,11 +106,17 @@ class RecognitionPipeline:
         self._last_process_time: Dict[str, float] = {}
         self.snapshots_dir = config.get("snapshots_dir", "data/snapshots")
         os.makedirs(self.snapshots_dir, exist_ok=True)
+        # Shared OCR engine singleton for cross-camera batching
+        self.shared_ocr = OCREngine(
+            gpu=config.get("gpu_enabled", False),
+            confidence=config.get("confidence_ocr", 0.4),
+        )
 
     def add_camera(self, camera_id: str, stream_url: str, name: str = "",
                    mask_path: str = ""):
         self.camera_manager.add_camera(camera_id, stream_url, name, mask_path)
-        self.detectors[camera_id] = CameraDetectors(camera_id, self.config)
+        self.detectors[camera_id] = CameraDetectors(camera_id, self.config,
+                                                      shared_ocr=self.shared_ocr)
 
     def set_result_callback(self, callback: Callable):
         self._on_result_callback = callback

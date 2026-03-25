@@ -30,7 +30,8 @@ class PlateDetector:
         try:
             from ultralytics import YOLO
             model = YOLO(pt_path)
-            model.export(format="engine", half=True, device=self.device)
+            dev = int(self.device.split(":")[-1]) if "cuda" in str(self.device) else 0
+            model.export(format="engine", half=True, device=dev)
             if os.path.exists(engine_path):
                 self.model = YOLO(engine_path)
                 logger.info(f"Plate detector exported to TensorRT: {engine_path}")
@@ -62,6 +63,7 @@ class PlateDetector:
             self._loaded = True
         except Exception as e:
             logger.error(f"Failed to load plate detector: {e}")
+            self._loaded = True
 
     def detect(self, frame: np.ndarray) -> Dict[str, Any]:
         result = {
@@ -87,7 +89,15 @@ class PlateDetector:
                 x1, y1, x2, y2, score, class_id = det
                 if int(class_id) == 0 and score > self.confidence and score > best_score:
                     best_score = score
+                    h, w = frame.shape[:2]
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # Clamp coordinates to frame dimensions
+                    x1 = max(0, min(x1, w))
+                    y1 = max(0, min(y1, h))
+                    x2 = max(0, min(x2, w))
+                    y2 = max(0, min(y2, h))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
                     plate_img = frame[y1:y2, x1:x2].copy()
                     best_detection = {
                         "detected": True,

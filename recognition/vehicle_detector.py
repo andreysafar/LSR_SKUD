@@ -35,7 +35,8 @@ class VehicleDetector:
         try:
             from ultralytics import YOLO
             model = YOLO(pt_path)
-            model.export(format="engine", half=True, device=self.device)
+            dev = int(self.device.split(":")[-1]) if "cuda" in str(self.device) else 0
+            model.export(format="engine", half=True, device=dev)
             if os.path.exists(engine_path):
                 self.model = YOLO(engine_path)
                 logger.info(f"Vehicle detector exported to TensorRT: {engine_path}")
@@ -66,6 +67,7 @@ class VehicleDetector:
             self._loaded = True
         except Exception as e:
             logger.error(f"Failed to load vehicle detector: {e}")
+            self._loaded = True
 
     def detect(self, frame: np.ndarray) -> Dict[str, Any]:
         result = {

@@ -52,7 +52,7 @@ class GateController:
         plate_clean = plate_number.upper().replace(" ", "")
         camera = self._get_camera(camera_id)
         direction = camera.get("direction", "both") if camera else "both"
-        recognition_type = camera.get("recognition_type", "gpu") if camera else "gpu"
+        recognition_type = camera.get("recognition_type", "gpu").lower() if camera else "gpu"
         gate_territory_id = camera.get("gate_device_id", "") if camera else ""
         result["direction"] = direction
 
@@ -74,9 +74,19 @@ class GateController:
         result["pass_found"] = True
         result["pass_id"] = active_pass["id"]
 
-        # Проверка лимита одновременного нахождения (для меток/собственников)
+        # Для direction=="both" определяем фактическое направление по журналу
+        actual_direction = direction
+        if direction == "both":
+            existing = self.db.get_vehicles_on_premises()
+            is_on_premises = any(
+                v["plate_number"].upper().replace(" ", "") == plate_clean
+                for v in existing
+            )
+            actual_direction = "exit" if is_on_premises else "entry"
+
+        # Проверка лимита одновременного нахождения (только для фактических въездов)
         owner_parsec_id = active_pass.get("owner_parsec_id")
-        if owner_parsec_id and direction in ("entry", "both"):
+        if owner_parsec_id and actual_direction == "entry":
             limit_ok = self._check_parking_limit(owner_parsec_id)
             if not limit_ok:
                 result["details"] = "Превышен лимит одновременного нахождения т/с"
@@ -103,23 +113,12 @@ class GateController:
             # Parsec сам открыл — мы просто логируем
             result["gate_opened"] = True
             result["details"] = "Ворота открыты (штатное Parsec)"
-        elif gate_territory_id and self.parsec:
-            # Fallback: прямая команда
-            try:
-                session_id = self._ensure_session()
-                if session_id:
-                    success = self.parsec.open_gate(session_id, gate_territory_id)
-                    result["gate_opened"] = success
-                    result["details"] = "Ворота открыты" if success else "Ошибка открытия"
-                else:
-                    result["details"] = "Нет сессии Parsec"
-            except Exception as e:
-                result["details"] = f"Ошибка управления воротами: {e}"
-                logger.error(f"Gate control error: {e}")
-                self._session_id = None
         else:
-            result["gate_opened"] = True
-            result["details"] = "Ворота открыты (симуляция)"
+            result["gate_opened"] = False
+            logger.error(f"Cannot process plate {plate_clean}: no valid recognition path "
+                         f"(recognition_type={recognition_type}, territory={gate_territory_id}, "
+                         f"parsec={'available' if self.parsec else 'unavailable'})")
+            result["details"] = "Нет доступного способа обработки распознавания"
 
         # Логирование gate event
         self.db.save_gate_event(
@@ -153,23 +152,32 @@ class GateController:
     def _send_to_parsec(self, territory_id: str, plate_clean: str,
                          active_pass: Dict) -> bool:
         """Отправка распознанного номера в Parsec для принятия решения.
-        GPU-камера эмулирует считывание номера."""
+        GPU-камера эмулирует считывание номера. Parsec сам решает, открывать ли."""
         try:
             session_id = self._ensure_session()
             if not session_id:
+                logger.error("Cannot send to Parsec: no session available")
                 return False
+
+            # Отправляем распознанный номер в Parsec для идентификации
+            success = self.parsec.send_plate_recognition(
+                session_id, territory_id, plate_clean
+            )
+            if success:
+                return True
 
             # Попытка через SendVerificationCommand если есть person_id
             owner_parsec_id = active_pass.get("owner_parsec_id")
             if owner_parsec_id:
                 success = self.parsec.send_verification_command(
-                    session_id, territory_id, owner_parsec_id, pass_allow=True
+                    session_id, territory_id, owner_parsec_id
                 )
                 if success:
                     return True
 
-            # Fallback: прямая команда открытия (если Parsec подтвердил пропуск через API)
-            return self.parsec.open_gate(session_id, territory_id)
+            logger.error(f"Failed to send plate recognition to Parsec: "
+                         f"territory={territory_id}, plate={plate_clean}")
+            return False
         except Exception as e:
             logger.error(f"Send to Parsec error: {e}")
             self._session_id = None
@@ -189,6 +197,7 @@ class GateController:
                         if exit_record:
                             logger.info(f"Exit recorded: {plate_number}, duration={exit_record.get('duration_minutes')}min")
                             return exit_record["id"]
+                    logger.warning(f"Duplicate entry suppressed: {plate_number} already on premises")
                     return None  # Уже на территории, дубль entry
 
             # Новый въезд

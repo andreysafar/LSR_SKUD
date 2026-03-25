@@ -402,21 +402,124 @@ class TelegramBot:
             else:
                 await query.answer("Не удалось отменить пропуск")
 
-        elif data.startswith("duration:"):
-            parts = data.split(":")
-            duration = parts[1]
+        elif data.startswith("type:"):
+            pass_type = data.split(":")[1]
             state = self.user_states.get(user_id, {})
             plate = state.get("plate")
-            if plate:
-                result = self.pass_handler.create_vehicle_pass(user_id, plate, duration)
-                await query.answer(result["message"])
+            if not plate:
+                await query.answer("Сначала отправьте номер авто")
+                return
+
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            if pass_type == "loading":
+                user = self.db.get_user(user_id)
+                access_group_id = user.get("default_access_group") if user else None
+                result = self.pass_handler.create_loading_pass(
+                    user_id, plate, access_group_id=access_group_id
+                )
+                await query.answer(result["message"][:200])
                 await query.edit_message_text(
                     f"✅ {result['message']}" if result["success"]
                     else f"❌ {result['message']}"
                 )
                 self.user_states.pop(user_id, None)
-            else:
+
+            elif pass_type == "guest":
+                spots = self.pass_handler.get_user_parking_spots(user_id)
+                if not spots:
+                    await query.answer("У вас нет привязанных м/м")
+                    await query.edit_message_text(
+                        "❌ У вас нет привязанных машиномест. "
+                        "Гостевой пропуск невозможен."
+                    )
+                    self.user_states.pop(user_id, None)
+                    return
+                self.user_states[user_id] = {"plate": plate, "type": "guest"}
+                keyboard = []
+                for s in spots:
+                    label = s.get("name") or s.get("number") or f"М/м #{s['id']}"
+                    keyboard.append([InlineKeyboardButton(
+                        label, callback_data=f"spot:{s['id']}"
+                    )])
+                await query.edit_message_text(
+                    f"🚗 Гостевой пропуск: {plate}\n\nВыберите машиноместо:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+
+            elif pass_type == "regular":
+                self.user_states[user_id] = {"plate": plate, "type": "regular"}
+                keyboard = [
+                    [InlineKeyboardButton("До конца дня", callback_data="duration:day_end")],
+                    [InlineKeyboardButton("3 часа", callback_data="duration:3hours")],
+                    [InlineKeyboardButton("24 часа", callback_data="duration:24hours")],
+                    [InlineKeyboardButton("1 неделя", callback_data="duration:week")],
+                ]
+                await query.edit_message_text(
+                    f"🚗 Обычный пропуск: {plate}\n\nВыберите срок:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+
+        elif data.startswith("spot:"):
+            spot_id = int(data.split(":")[1])
+            state = self.user_states.get(user_id, {})
+            plate = state.get("plate")
+            if not plate:
                 await query.answer("Сначала отправьте номер авто")
+                return
+
+            self.user_states[user_id] = {
+                "plate": plate, "type": "guest", "spot_id": spot_id
+            }
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            keyboard = [
+                [InlineKeyboardButton("До конца дня", callback_data="duration:day_end")],
+                [InlineKeyboardButton("3 часа", callback_data="duration:3hours")],
+                [InlineKeyboardButton("24 часа", callback_data="duration:24hours")],
+                [InlineKeyboardButton("1 неделя", callback_data="duration:week")],
+            ]
+            await query.edit_message_text(
+                f"🚗 Гостевой пропуск: {plate} (м/м #{spot_id})\n\nВыберите срок:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
+        elif data.startswith("duration:"):
+            parts = data.split(":")
+            duration = parts[1]
+            state = self.user_states.get(user_id, {})
+            plate = state.get("plate")
+            if not plate:
+                await query.answer("Сначала отправьте номер авто")
+                return
+
+            user = self.db.get_user(user_id)
+            access_group_id = user.get("default_access_group") if user else None
+            pass_type = state.get("type", "regular")
+
+            if pass_type == "guest":
+                spot_id = state.get("spot_id")
+                if not spot_id:
+                    await query.answer("Не выбрано машиноместо")
+                    return
+                result = self.pass_handler.create_guest_pass(
+                    user_id, plate,
+                    parking_spot_id=spot_id,
+                    access_group_id=access_group_id,
+                    duration=duration,
+                )
+            else:
+                result = self.pass_handler.create_vehicle_pass(
+                    user_id, plate,
+                    access_group_id=access_group_id,
+                    duration=duration,
+                )
+
+            await query.answer(result["message"][:200])
+            await query.edit_message_text(
+                f"✅ {result['message']}" if result["success"]
+                else f"❌ {result['message']}"
+            )
+            self.user_states.pop(user_id, None)
 
         elif data == FEEDBACK_BUTTON_CALLBACK:
             self.user_states[user_id] = {"waiting_feedback": True}
@@ -496,14 +599,13 @@ class TelegramBot:
 
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             keyboard = [
-                [InlineKeyboardButton("До конца дня", callback_data="duration:day_end")],
-                [InlineKeyboardButton("3 часа", callback_data="duration:3hours")],
-                [InlineKeyboardButton("24 часа", callback_data="duration:24hours")],
-                [InlineKeyboardButton("1 неделя", callback_data="duration:week")],
+                [InlineKeyboardButton("Разовый на погрузку (40 мин)", callback_data="type:loading")],
+                [InlineKeyboardButton("Гостевой (с м/м)", callback_data="type:guest")],
+                [InlineKeyboardButton("Обычный", callback_data="type:regular")],
             ]
 
             await update.message.reply_text(
-                f"🚗 Создание пропуска: {plate}\n\nВыберите срок:",
+                f"🚗 Создание пропуска: {plate}\n\nВыберите тип пропуска:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
         else:

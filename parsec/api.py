@@ -126,13 +126,21 @@ class ParsecAPI:
 
     def get_bot_session_id(self) -> Optional[str]:
         if self._bot_session:
-            return self._bot_session["session_id"]
+            sid = self._bot_session["session_id"]
+            if self.continue_session(sid):
+                return sid
+            # Session expired, re-open
+            self._bot_session = None
         sess = self.open_bot_session()
         return sess["session_id"] if sess else None
 
     def get_admin_session_id(self) -> Optional[str]:
         if self._admin_session:
-            return self._admin_session["session_id"]
+            sid = self._admin_session["session_id"]
+            if self.continue_session(sid):
+                return sid
+            # Session expired, re-open
+            self._admin_session = None
         sess = self.open_admin_session()
         return sess["session_id"] if sess else None
 
@@ -753,32 +761,57 @@ class ParsecAPI:
             if not client:
                 return None
             result = client.service.FindPersonByIdentifier(session_id, code)
-            if not result:
+            if not result or result.Result != 0:
+                return None
+            person = result.Value
+            if not person:
                 return None
             return {
-                "id": str(result.ID),
-                "last_name": getattr(result, "LAST_NAME", ""),
-                "first_name": getattr(result, "FIRST_NAME", ""),
-                "middle_name": getattr(result, "MIDDLE_NAME", ""),
-                "tab_num": getattr(result, "TAB_NUM", ""),
-                "org_id": str(getattr(result, "ORG_ID", "")),
+                "id": str(person.ID),
+                "last_name": getattr(person, "LAST_NAME", ""),
+                "first_name": getattr(person, "FIRST_NAME", ""),
+                "middle_name": getattr(person, "MIDDLE_NAME", ""),
+                "tab_num": getattr(person, "TAB_NUM", ""),
+                "org_id": str(getattr(person, "ORG_ID", "")),
             }
         except Exception as e:
             logger.error(f"FindPersonByIdentifier error: {e}")
             return None
 
+    def send_plate_recognition(self, session_id: str, territory_id: str,
+                                plate_number: str) -> bool:
+        """Отправка распознанного номера в Parsec для идентификации.
+        Parsec сам принимает решение о допуске на основе своей БД."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            result = client.service.SendIdentificationCommand(
+                session_id, territory_id, plate_number
+            )
+            if result and result.Result == 0:
+                logger.info(f"Plate recognition sent: territory={territory_id}, plate={plate_number}")
+                return True
+            if result:
+                logger.error(f"SendIdentificationCommand failed: {getattr(result, 'ErrorMessage', 'unknown')}")
+            return False
+        except Exception as e:
+            logger.error(f"SendIdentificationCommand error: {e}")
+            return False
+
     def send_verification_command(self, session_id: str, territory_id: str,
-                                   person_id: str, pass_allow: bool = True) -> bool:
-        """Отправка команды верификации прохода (для GPU-камер, эмуляция считывания)."""
+                                   person_id: str) -> bool:
+        """Отправка команды верификации прохода (для GPU-камер, эмуляция считывания).
+        Parsec сам принимает решение о допуске."""
         try:
             client = self._ensure_client()
             if not client:
                 return False
             result = client.service.SendVerificationCommand(
-                session_id, territory_id, person_id, pass_allow
+                session_id, territory_id, person_id
             )
             if result and result.Result == 0:
-                logger.info(f"Verification command sent: territory={territory_id}, person={person_id}, allow={pass_allow}")
+                logger.info(f"Verification command sent: territory={territory_id}, person={person_id}")
                 return True
             if result:
                 logger.error(f"SendVerificationCommand failed: {getattr(result, 'ErrorMessage', 'unknown')}")

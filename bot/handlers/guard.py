@@ -9,7 +9,7 @@
 """
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -21,14 +21,38 @@ INCIDENT_TYPES = {
     "other": "Прочее",
 }
 
+_GUARD_ROLE = "GuardOperator"
+_ACCESS_DENIED_MSG = "Доступ запрещён: недостаточно прав (роль охранника не подтверждена)."
+
 
 class GuardHandler:
     def __init__(self, db, parsec_api=None):
         self.db = db
         self.parsec = parsec_api
 
-    def get_duty_status(self) -> Dict:
+    def _verify_guard_role(self, session_id: str) -> Optional[str]:
+        """Проверка роли охранника через Parsec.
+
+        Returns:
+            None if verification passed, error message string otherwise.
+        """
+        if not self.parsec:
+            return "Parsec API не настроен, проверка роли невозможна."
+        try:
+            is_guard = self.parsec.check_role(session_id, _GUARD_ROLE)
+        except Exception as e:
+            logger.error(f"CheckRole failed: {e}")
+            return "Ошибка проверки роли. Попробуйте позже."
+        if not is_guard:
+            return _ACCESS_DENIED_MSG
+        return None
+
+    def get_duty_status(self, session_id: str) -> Dict:
         """Текущее состояние для начала смены."""
+        error = self._verify_guard_role(session_id)
+        if error:
+            return {"error": error}
+
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
 
@@ -61,6 +85,9 @@ class GuardHandler:
 
     def format_duty_status(self, status: Dict) -> str:
         """Форматирование статуса смены для Telegram."""
+        if "error" in status:
+            return status["error"]
+
         lines = [
             f"Начало смены: {status['timestamp']}",
             f"Т/С на территории: {status['vehicles_on_premises']}",
@@ -69,7 +96,7 @@ class GuardHandler:
             f"Нерешённые инциденты: {status['unresolved_incidents']}",
         ]
 
-        if status["expiring_soon"]:
+        if status.get("expiring_soon"):
             lines.append("\nИстекающие пропуска:")
             for p in status["expiring_soon"]:
                 lines.append(
@@ -79,9 +106,19 @@ class GuardHandler:
 
         return "\n".join(lines)
 
-    def get_active_passes_list(self, subtype: str = None) -> List[Dict]:
+    def get_active_passes_list(self, session_id: str,
+                               subtype: str = None) -> List[Dict]:
         """Список активных пропусков с деталями для охраны."""
+        error = self._verify_guard_role(session_id)
+        if error:
+            return [{"error": error}]
+
         passes = self.db.get_active_passes_by_subtype(subtype)
+
+        # Fetch parking spots ONCE to avoid N+1 queries
+        all_spots = self.db.get_parking_spots()
+        spots_by_id = {s["id"]: s for s in all_spots}
+
         enriched = []
         for p in passes:
             entry = {
@@ -101,13 +138,11 @@ class GuardHandler:
                     entry["owner_name"] = user.get("full_name", "")
                     entry["owner_phone"] = user.get("phone_number", "")
 
-            # Получить номер м/м
+            # Получить номер м/м из предзагруженного словаря
             if p.get("parking_spot_id"):
-                spots = self.db.get_parking_spots()
-                for s in spots:
-                    if s["id"] == p["parking_spot_id"]:
-                        entry["parking_spot_number"] = s.get("spot_number", "")
-                        break
+                spot = spots_by_id.get(p["parking_spot_id"])
+                if spot:
+                    entry["parking_spot_number"] = spot.get("spot_number", "")
 
             enriched.append(entry)
         return enriched
@@ -116,6 +151,9 @@ class GuardHandler:
         """Форматирование списка пропусков для Telegram."""
         if not passes:
             return "Активных пропусков нет"
+
+        if len(passes) == 1 and "error" in passes[0]:
+            return passes[0]["error"]
 
         lines = []
         for p in passes:
@@ -145,8 +183,13 @@ class GuardHandler:
 
         return "\n".join(lines)
 
-    def get_journal(self, limit: int = 30, date_from: str = None) -> List[Dict]:
+    def get_journal(self, session_id: str, limit: int = 30,
+                    date_from: str = None) -> List[Dict]:
         """Журнал въезда/выезда для охраны (только чтение)."""
+        error = self._verify_guard_role(session_id)
+        if error:
+            return [{"error": error}]
+
         if not date_from:
             date_from = datetime.now().strftime("%Y-%m-%d 00:00:00")
         return self.db.get_entry_exit_log(limit=limit, date_from=date_from)
@@ -155,6 +198,9 @@ class GuardHandler:
         """Форматирование журнала для Telegram."""
         if not entries:
             return "Записей за сегодня нет"
+
+        if len(entries) == 1 and "error" in entries[0]:
+            return entries[0]["error"]
 
         lines = []
         for e in entries:
@@ -170,7 +216,7 @@ class GuardHandler:
                 exit_time = exit_time[11:16]
 
             line = f"{entry_time}→{exit_time} | {plate}"
-            if duration:
+            if duration is not None:
                 line += f" | {int(duration)} мин"
             if subtype:
                 line += f" | {subtype}"
@@ -178,10 +224,15 @@ class GuardHandler:
 
         return "\n".join(lines)
 
-    def create_incident(self, incident_type: str, description: str,
-                         plate_number: str = None, apartment: str = None,
-                         reported_by_user_id: int = None) -> int:
+    def create_incident(self, session_id: str, incident_type: str,
+                         description: str, plate_number: str = None,
+                         apartment: str = None,
+                         reported_by_user_id: int = None) -> Dict:
         """Фиксация инцидента охраной."""
+        error = self._verify_guard_role(session_id)
+        if error:
+            return {"error": error}
+
         incident_id = self.db.create_incident(
             incident_type=incident_type,
             description=description,
@@ -191,7 +242,7 @@ class GuardHandler:
             reported_by_role="guard",
         )
         logger.info(f"Incident created: type={incident_type}, id={incident_id}")
-        return incident_id
+        return {"incident_id": incident_id}
 
     def get_incident_types(self) -> Dict[str, str]:
         return INCIDENT_TYPES

@@ -1,8 +1,7 @@
 """Система уведомлений для пропускного режима ЖК.
 
-Использует asyncio tasks для планирования уведомлений:
-- За 5-10 мин до окончания разового пропуска → собственнику
-- Превышение 40 мин → охране + собственнику
+Использует APScheduler для планирования уведомлений:
+- Через 30/35/40 мин после создания разового пропуска → собственнику/охране
 - Прибытие/убытие гостя → собственнику
 - Въезд без пропуска/метки → охране + УК
 - Несоответствие номера и метки → охране
@@ -12,66 +11,90 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Callable, Dict, Any
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from db.database import get_db
 
 logger = logging.getLogger(__name__)
 
 
 class NotificationScheduler:
-    """Планировщик уведомлений на asyncio tasks."""
+    """Планировщик уведомлений на APScheduler."""
 
     def __init__(self, send_message_callback: Callable = None,
                  guard_chat_id: int = None, uk_chat_id: int = None):
-        self._tasks: Dict[str, asyncio.Task] = {}
+        self._scheduler = AsyncIOScheduler()
         self.send_message = send_message_callback
         self.guard_chat_id = guard_chat_id
         self.uk_chat_id = uk_chat_id
         self.db = get_db()
 
+    def start(self):
+        """Запуск планировщика."""
+        self._scheduler.start()
+        logger.info("NotificationScheduler started")
+
+    def shutdown(self, wait: bool = True):
+        """Остановка планировщика."""
+        self._scheduler.shutdown(wait=wait)
+        logger.info("NotificationScheduler shut down")
+
     def schedule_loading_pass_notifications(self, pass_id: int,
                                               owner_user_id: int,
                                               plate_number: str,
-                                              valid_to_str: str):
-        """Планирование уведомлений для разового пропуска (40 мин)."""
+                                              created_at_str: str):
+        """Планирование уведомлений для разового пропуска (40 мин).
+
+        Уведомления планируются относительно момента создания пропуска:
+        - creation + 30 мин (осталось 10 мин)
+        - creation + 35 мин (осталось 5 мин)
+        - creation + 40 мин (проверка выезда)
+        """
         try:
-            valid_to = datetime.strptime(valid_to_str, "%Y-%m-%d %H:%M:%S")
+            created_at = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            logger.error(f"Invalid valid_to format: {valid_to_str}")
+            logger.error(f"Invalid created_at format: {created_at_str}")
             return
 
         now = datetime.now()
 
-        # За 10 мин до окончания
-        notify_10 = valid_to - timedelta(minutes=10)
-        if notify_10 > now:
-            delay_10 = (notify_10 - now).total_seconds()
-            task_key = f"loading_10min_{pass_id}"
-            self._schedule_task(
-                task_key, delay_10,
+        # Через 30 мин после создания (осталось 10 мин)
+        notify_30 = created_at + timedelta(minutes=30)
+        if notify_30 > now:
+            job_id = f"loading_10min_{pass_id}"
+            self._scheduler.add_job(
                 self._notify_loading_expiring,
-                owner_user_id, plate_number, 10
+                trigger='date',
+                run_date=notify_30,
+                args=[owner_user_id, plate_number, 10],
+                id=job_id,
+                replace_existing=True,
             )
 
-        # За 5 мин до окончания
-        notify_5 = valid_to - timedelta(minutes=5)
-        if notify_5 > now:
-            delay_5 = (notify_5 - now).total_seconds()
-            task_key = f"loading_5min_{pass_id}"
-            self._schedule_task(
-                task_key, delay_5,
+        # Через 35 мин после создания (осталось 5 мин)
+        notify_35 = created_at + timedelta(minutes=35)
+        if notify_35 > now:
+            job_id = f"loading_5min_{pass_id}"
+            self._scheduler.add_job(
                 self._notify_loading_expiring,
-                owner_user_id, plate_number, 5
+                trigger='date',
+                run_date=notify_35,
+                args=[owner_user_id, plate_number, 5],
+                id=job_id,
+                replace_existing=True,
             )
 
-        # Проверка выезда после окончания (через 1 мин после valid_to)
-        check_time = valid_to + timedelta(minutes=1)
-        if check_time > now:
-            delay_check = (check_time - now).total_seconds()
-            task_key = f"loading_check_{pass_id}"
-            self._schedule_task(
-                task_key, delay_check,
+        # Через 40 мин после создания (проверка выезда)
+        notify_40 = created_at + timedelta(minutes=40)
+        if notify_40 > now:
+            job_id = f"loading_check_{pass_id}"
+            self._scheduler.add_job(
                 self._check_loading_overstay,
-                pass_id, owner_user_id, plate_number
+                trigger='date',
+                run_date=notify_40,
+                args=[pass_id, owner_user_id, plate_number],
+                id=job_id,
+                replace_existing=True,
             )
 
     def schedule_guest_arrival_notification(self, owner_user_id: int,
@@ -92,7 +115,7 @@ class NotificationScheduler:
         """Уведомление собственнику об убытии гостя."""
         if self.send_message:
             text = f"Ваш гость уехал (т/с {plate_number})"
-            if duration_min:
+            if duration_min is not None:
                 text += f", время на территории: {int(duration_min)} мин"
             asyncio.ensure_future(
                 self._send_notification(owner_user_id, text)
@@ -143,6 +166,10 @@ class NotificationScheduler:
     def notify_incident(self, owner_user_id: int, incident_type: str,
                          description: str):
         """Уведомление собственнику об инциденте от охраны."""
+        if not self.send_message:
+            logger.warning("No send_message callback, cannot notify incident")
+            return
+
         type_names = {
             "parking_violation": "Парковка в проезде",
             "wrong_spot": "Занятие чужого м/м",
@@ -160,28 +187,13 @@ class NotificationScheduler:
     def cancel_pass_notifications(self, pass_id: int):
         """Отмена уведомлений при отмене пропуска."""
         for suffix in ["10min", "5min", "check"]:
-            task_key = f"loading_{suffix}_{pass_id}"
-            if task_key in self._tasks:
-                self._tasks[task_key].cancel()
-                del self._tasks[task_key]
+            job_id = f"loading_{suffix}_{pass_id}"
+            try:
+                self._scheduler.remove_job(job_id)
+            except Exception:
+                pass
 
     # --- Внутренние методы ---
-
-    def _schedule_task(self, task_key: str, delay_seconds: float,
-                        coro_func, *args):
-        if task_key in self._tasks:
-            self._tasks[task_key].cancel()
-
-        async def _delayed():
-            await asyncio.sleep(delay_seconds)
-            try:
-                await coro_func(*args)
-            except Exception as e:
-                logger.error(f"Notification task {task_key} error: {e}")
-            finally:
-                self._tasks.pop(task_key, None)
-
-        self._tasks[task_key] = asyncio.ensure_future(_delayed())
 
     async def _notify_loading_expiring(self, owner_user_id: int,
                                          plate_number: str, minutes_left: int):
@@ -221,7 +233,7 @@ class NotificationScheduler:
                     owner_user_id=owner_user_id
                 )
                 if count >= 2:
-                    # Второе нарушение → уведомление о блокировке
+                    # Второе нарушение -> уведомление о блокировке
                     await self._send_notification(
                         owner_user_id,
                         "Повторное нарушение! Вы добавлены в чёрный список. "

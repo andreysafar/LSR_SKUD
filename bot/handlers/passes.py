@@ -86,15 +86,27 @@ class PassHandler:
             result["message"] = "Invalid plate number"
             return result
 
+        if not RU_PLATE_PATTERN.match(plate_clean):
+            result["message"] = "Некорректный формат номера. Ожидается формат А123ВС77."
+            return result
+
         user = self.db.get_user(user_id)
         if not user:
             result["message"] = "User not authenticated"
             return result
 
+        # Проверка чёрного списка
+        if user.get("parsec_person_id") and self.parsec and self.parsec.host:
+            if self._is_blocked(user["parsec_person_id"]):
+                result["message"] = ("Вы находитесь в чёрном списке. "
+                                     "Создание пропусков невозможно. Обратитесь в УК.")
+                return result
+
         valid_from, valid_to, duration_text = self._compute_validity(duration)
 
         parsec_identifier_code = None
         if self.parsec and self.parsec.host and access_group_id:
+            session_id = None
             try:
                 session_data = self.parsec.open_admin_session()
                 if session_data:
@@ -117,9 +129,14 @@ class PassHandler:
                             logger.warning(f"Failed to add plate identifier in Parsec for {plate_clean}")
                     else:
                         logger.warning(f"Failed to create vehicle in Parsec for {plate_clean}")
-                    self.parsec.close_session(session_id)
             except Exception as e:
                 logger.error(f"Parsec vehicle pass creation failed: {e}")
+            finally:
+                if session_id:
+                    try:
+                        self.parsec.close_session(session_id)
+                    except Exception as e:
+                        logger.error(f"Failed to close Parsec session: {e}")
 
         pass_data = self.db.create_pass(
             user_id=user_id,
@@ -131,7 +148,17 @@ class PassHandler:
             parsec_pass_id=parsec_identifier_code,
         )
 
-        result["success"] = True
+        if self.parsec and self.parsec.host and access_group_id and parsec_identifier_code:
+            result["success"] = True
+        elif not (self.parsec and self.parsec.host and access_group_id):
+            result["success"] = True
+        else:
+            result["success"] = False
+            result["message"] = f"Пропуск сохранён, но не удалось создать идентификатор в Parsec для {plate_clean}"
+            result["pass_data"] = pass_data
+            logger.warning(f"Vehicle pass saved without Parsec identifier: user={user_id}, plate={plate_clean}")
+            return result
+
         result["message"] = f"Vehicle pass created for {plate_clean} ({duration_text})"
         result["pass_data"] = pass_data
         logger.info(f"Vehicle pass created: user={user_id}, plate={plate_clean}")
@@ -145,6 +172,10 @@ class PassHandler:
         plate_clean = normalize_plate_input(plate_number)
         if not plate_clean:
             result["message"] = "Некорректный номер т/с"
+            return result
+
+        if not RU_PLATE_PATTERN.match(plate_clean):
+            result["message"] = "Некорректный формат номера. Ожидается формат А123ВС77."
             return result
 
         user = self.db.get_user(user_id)
@@ -163,6 +194,7 @@ class PassHandler:
 
         parsec_identifier_code = None
         if self.parsec and self.parsec.host and access_group_id:
+            session_id = None
             try:
                 session_data = self.parsec.open_admin_session()
                 if session_data:
@@ -180,9 +212,14 @@ class PassHandler:
                         )
                         if success:
                             parsec_identifier_code = plate_code
-                    self.parsec.close_session(session_id)
             except Exception as e:
                 logger.error(f"Parsec loading pass creation failed: {e}")
+            finally:
+                if session_id:
+                    try:
+                        self.parsec.close_session(session_id)
+                    except Exception as e:
+                        logger.error(f"Failed to close Parsec session: {e}")
 
         pass_data = self.db.create_pass_extended(
             user_id=user_id,
@@ -196,6 +233,12 @@ class PassHandler:
             access_group_id=access_group_id or user.get("default_access_group"),
             parsec_pass_id=parsec_identifier_code,
         )
+
+        if self.parsec and self.parsec.host and access_group_id and not parsec_identifier_code:
+            result["success"] = False
+            result["message"] = f"Пропуск сохранён, но не удалось создать идентификатор в Parsec для {plate_clean}"
+            result["pass_data"] = pass_data
+            return result
 
         result["success"] = True
         result["message"] = (f"Разовый пропуск на погрузку создан для {plate_clean} "
@@ -216,6 +259,10 @@ class PassHandler:
         plate_clean = normalize_plate_input(plate_number)
         if not plate_clean:
             result["message"] = "Некорректный номер т/с"
+            return result
+
+        if not RU_PLATE_PATTERN.match(plate_clean):
+            result["message"] = "Некорректный формат номера. Ожидается формат А123ВС77."
             return result
 
         user = self.db.get_user(user_id)
@@ -246,6 +293,7 @@ class PassHandler:
 
         parsec_identifier_code = None
         if self.parsec and self.parsec.host and access_group_id:
+            session_id = None
             try:
                 session_data = self.parsec.open_admin_session()
                 if session_data:
@@ -264,9 +312,14 @@ class PassHandler:
                         )
                         if success:
                             parsec_identifier_code = plate_code
-                    self.parsec.close_session(session_id)
             except Exception as e:
                 logger.error(f"Parsec guest pass creation failed: {e}")
+            finally:
+                if session_id:
+                    try:
+                        self.parsec.close_session(session_id)
+                    except Exception as e:
+                        logger.error(f"Failed to close Parsec session: {e}")
 
         pass_data = self.db.create_pass_extended(
             user_id=user_id,
@@ -282,6 +335,12 @@ class PassHandler:
             access_group_id=access_group_id or user.get("default_access_group"),
             parsec_pass_id=parsec_identifier_code,
         )
+
+        if self.parsec and self.parsec.host and access_group_id and not parsec_identifier_code:
+            result["success"] = False
+            result["message"] = f"Пропуск сохранён, но не удалось создать идентификатор в Parsec для {plate_clean}"
+            result["pass_data"] = pass_data
+            return result
 
         result["success"] = True
         result["message"] = (f"Гостевой пропуск создан для {plate_clean} "
@@ -326,6 +385,7 @@ class PassHandler:
 
         parsec_identifier_code = None
         if self.parsec and self.parsec.host and user.get("parsec_person_id"):
+            session_id = None
             try:
                 session_data = self.parsec.open_admin_session()
                 if session_data:
@@ -339,9 +399,14 @@ class PassHandler:
                     )
                     if success:
                         parsec_identifier_code = code
-                    self.parsec.close_session(session_id)
             except Exception as e:
                 logger.error(f"Parsec access pass creation failed: {e}")
+            finally:
+                if session_id:
+                    try:
+                        self.parsec.close_session(session_id)
+                    except Exception as e:
+                        logger.error(f"Failed to close Parsec session: {e}")
 
         pass_data = self.db.create_pass(
             user_id=user_id,
@@ -352,6 +417,12 @@ class PassHandler:
             valid_to=valid_to,
             parsec_pass_id=parsec_identifier_code,
         )
+
+        if self.parsec and self.parsec.host and user.get("parsec_person_id") and not parsec_identifier_code:
+            result["success"] = False
+            result["message"] = f"Пропуск сохранён, но не удалось создать идентификатор в Parsec для {access_group_name}"
+            result["pass_data"] = pass_data
+            return result
 
         result["success"] = True
         result["message"] = f"Access pass created for {access_group_name}"
@@ -366,15 +437,22 @@ class PassHandler:
         for p in passes:
             if p["id"] == pass_id:
                 if p.get("parsec_pass_id") and self.parsec and self.parsec.host:
+                    session_id = None
                     try:
                         session_data = self.parsec.open_admin_session()
                         if session_data:
+                            session_id = session_data["session_id"]
                             self.parsec.delete_identifier(
-                                session_data["session_id"], p["parsec_pass_id"]
+                                session_id, p["parsec_pass_id"]
                             )
-                            self.parsec.close_session(session_data["session_id"])
                     except Exception as e:
                         logger.error(f"Parsec identifier deletion failed: {e}")
+                    finally:
+                        if session_id:
+                            try:
+                                self.parsec.close_session(session_id)
+                            except Exception as e:
+                                logger.error(f"Failed to close Parsec session: {e}")
                 self.db.deactivate_pass(pass_id)
                 return True
         return False
