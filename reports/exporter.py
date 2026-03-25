@@ -18,21 +18,47 @@ except ImportError:
     HAS_PANDAS = False
 
 
+def _parse_dt(value: str) -> Optional[datetime]:
+    """Parse a datetime string, returning None on failure."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
 class ReportExporter:
     def __init__(self, db):
         self.db = db
 
     def export_passes(self, date_from: str = None, date_to: str = None,
-                       subtype: str = None, format: str = "csv") -> bytes:
-        """Реестр пропусков за период."""
-        passes = self.db.get_active_passes_by_subtype(subtype)
+                       subtype: str = None,
+                       export_format: str = "csv") -> bytes:
+        """Реестр пропусков за период (включая исторические)."""
+        # Получаем ВСЕ пропуска (не только активные) через прямой запрос
+        with self.db.get_connection() as conn:
+            sql = "SELECT * FROM passes WHERE 1=1"
+            params: list = []
+            if subtype:
+                sql += " AND pass_subtype = ?"
+                params.append(subtype)
+            sql += " ORDER BY created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+        passes = [dict(r) for r in rows]
+
+        # Фильтрация по дате — сравниваем через datetime, а не строки
         if date_from or date_to:
+            dt_from = _parse_dt(date_from) if date_from else None
+            dt_to = _parse_dt(date_to) if date_to else None
             filtered = []
             for p in passes:
-                created = p.get("created_at", "")
-                if date_from and created < date_from:
+                created = _parse_dt(p.get("created_at", ""))
+                if created is None:
                     continue
-                if date_to and created > date_to:
+                if dt_from and created < dt_from:
+                    continue
+                if dt_to and created > dt_to:
                     continue
                 filtered.append(p)
             passes = filtered
@@ -43,10 +69,10 @@ class ReportExporter:
         headers = ["ID", "Номер т/с", "Тип", "Марка", "Тел. водителя",
                     "Начало", "Окончание", "Статус", "М/М", "Создан"]
 
-        return self._export_data(passes, columns, headers, format)
+        return self._export_data(passes, columns, headers, export_format)
 
     def export_entry_exit_log(self, date_from: str = None, date_to: str = None,
-                                format: str = "csv") -> bytes:
+                                export_format: str = "csv") -> bytes:
         """Журнал въезда/выезда."""
         entries = self.db.get_entry_exit_log(
             limit=10000, date_from=date_from, date_to=date_to
@@ -57,19 +83,23 @@ class ReportExporter:
         headers = ["Номер т/с", "Въезд", "Выезд", "Длительность (мин)",
                     "Тип пропуска", "Камера въезда", "Камера выезда"]
 
-        return self._export_data(entries, columns, headers, format)
+        return self._export_data(entries, columns, headers, export_format)
 
     def export_incidents(self, date_from: str = None, date_to: str = None,
-                          format: str = "csv") -> bytes:
+                          export_format: str = "csv") -> bytes:
         """Реестр инцидентов."""
         incidents = self.db.get_incidents(limit=10000)
         if date_from or date_to:
+            dt_from = _parse_dt(date_from) if date_from else None
+            dt_to = _parse_dt(date_to) if date_to else None
             filtered = []
             for inc in incidents:
-                created = inc.get("created_at", "")
-                if date_from and created < date_from:
+                created = _parse_dt(inc.get("created_at", ""))
+                if created is None:
                     continue
-                if date_to and created > date_to:
+                if dt_from and created < dt_from:
+                    continue
+                if dt_to and created > dt_to:
                     continue
                 filtered.append(inc)
             incidents = filtered
@@ -79,30 +109,73 @@ class ReportExporter:
         headers = ["ID", "Тип", "Описание", "Номер т/с", "Квартира",
                     "Дата", "Решено", "Решение"]
 
-        return self._export_data(incidents, columns, headers, format)
+        return self._export_data(incidents, columns, headers, export_format)
 
-    def export_violation_summary(self, format: str = "csv") -> bytes:
+    def export_violation_summary(self, export_format: str = "csv") -> bytes:
         """Сводка по нарушениям (для ЧС)."""
         with self.db.get_connection() as conn:
-            rows = conn.execute("""
-                SELECT v.owner_parsec_id, v.violation_type, v.count,
-                       v.last_violation_at, u.full_name, u.phone_number
-                FROM violation_counts v
-                LEFT JOIN users u ON v.owner_user_id = u.user_id
-                ORDER BY v.count DESC
-            """).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM violation_counts ORDER BY count DESC"
+            ).fetchall()
+            violation_data = [dict(r) for r in rows]
 
-        data = [dict(r) for r in rows]
+        # Обогащаем данными пользователей
+        data = []
+        for v in violation_data:
+            entry = dict(v)
+            if v.get("owner_user_id"):
+                user = self.db.get_user(v["owner_user_id"])
+                if user:
+                    entry["full_name"] = user.get("full_name", "")
+                    entry["phone_number"] = user.get("phone_number", "")
+            data.append(entry)
+
         columns = ["owner_parsec_id", "full_name", "phone_number",
                     "violation_type", "count", "last_violation_at"]
         headers = ["Parsec ID", "ФИО", "Телефон", "Тип нарушения",
                     "Кол-во", "Последнее"]
 
-        return self._export_data(data, columns, headers, format)
+        return self._export_data(data, columns, headers, export_format)
+
+    def export_blacklist(self, violation_threshold: int = 2,
+                          export_format: str = "csv") -> bytes:
+        """Экспорт чёрного списка: лица с нарушениями >= порога."""
+        with self.db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM violation_counts WHERE count >= ? "
+                "ORDER BY count DESC",
+                (violation_threshold,),
+            ).fetchall()
+            violation_data = [dict(r) for r in rows]
+
+        # Обогащаем данными пользователей
+        data = []
+        for v in violation_data:
+            entry = dict(v)
+            if v.get("owner_user_id"):
+                user = self.db.get_user(v["owner_user_id"])
+                if user:
+                    entry["full_name"] = user.get("full_name", "")
+                    entry["phone_number"] = user.get("phone_number", "")
+                    entry["apartment"] = user.get("apartment", "")
+            data.append(entry)
+
+        columns = ["owner_parsec_id", "full_name", "phone_number",
+                    "apartment", "violation_type", "count",
+                    "last_violation_at"]
+        headers = ["Parsec ID", "ФИО", "Телефон", "Квартира",
+                    "Тип нарушения", "Кол-во", "Последнее"]
+
+        return self._export_data(data, columns, headers, export_format)
 
     def _export_data(self, data: List[Dict], columns: List[str],
-                      headers: List[str], format: str) -> bytes:
-        if format == "excel" and HAS_PANDAS:
+                      headers: List[str], export_format: str) -> bytes:
+        if export_format == "excel":
+            if not HAS_PANDAS:
+                raise RuntimeError(
+                    "Excel export requires pandas and openpyxl. "
+                    "Install them with: pip install pandas openpyxl"
+                )
             return self._to_excel(data, columns, headers)
         return self._to_csv(data, columns, headers)
 
