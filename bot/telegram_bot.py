@@ -806,6 +806,10 @@ class TelegramBot:
             **result.to_dict()
         )
 
+        if getattr(result, 'is_duplicate', False):
+            logger.debug(f"Skipping duplicate plate: {result.normalized_plate}")
+            return
+
         if result.normalized_plate:
             gate_result = self.gate_controller.check_plate_and_open(
                 result.camera_id, result.normalized_plate, event_id
