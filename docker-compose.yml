@@ -1,0 +1,179 @@
+# Build uses Docker layer cache; run `docker compose build --no-cache` only when you need a full rebuild.
+
+services:
+  # Main LSR_SKUD application (Streamlit web UI)
+  lsr-skud:
+    build:
+      context: .
+      target: production
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
+    image: lsr-skud:latest
+    container_name: lsr-skud-app
+    ports:
+      - "8501:8501"
+    env_file: .env
+    environment:
+      - UV_CACHE_DIR=/app/.cache
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - NO_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - no_proxy=
+      - DB_PATH=/app/data/gate_control.db
+      - MODELS_DIR=/app/models
+      - SNAPSHOTS_DIR=/app/data/snapshots
+      - ANPR_OUTPUT_CSV_PATH=/app/data/plates.csv
+      - ANPR_OUTPUT_IMAGES_DIR=/app/data/snapshots
+      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
+
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - /mnt/video_archive:/mnt/video_archive:ro
+      - ./batch_processing/logs:/app/batch_processing/logs
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Telegram bot + recognition pipeline
+  telegram-bot:
+    image: lsr-skud:latest
+    container_name: lsr-skud-bot
+    runtime: nvidia
+    network_mode: host  # Required for RTSP stream access
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DEVICE=cuda
+      - GPU_ENABLED=true
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - TELEGRAM_PROXY_URL=${TELEGRAM_PROXY_URL:-}
+    depends_on:
+      lsr-skud:
+        condition: service_started
+    env_file: .env
+    command: [".venv/bin/python", "main.py"]
+
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Dedicated batch processing worker
+  batch-worker:
+    build:
+      context: .
+      target: batch-worker
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
+    image: lsr-skud:batch-worker
+    container_name: lsr-skud-batch-worker
+    runtime: nvidia
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - DB_PATH=/app/data/gate_control.db
+      - ANPR_INPUT_DIRECTORIES=/mnt/video_archive/CAM_14,/mnt/video_archive/CAM_16
+      - ANPR_VIDEO_EXTENSION=.issvd
+      - ANPR_OUTPUT_CSV_PATH=/app/data/batch_plates.csv
+      - ANPR_OUTPUT_IMAGES_DIR=/app/data/snapshots
+      - CUDA_VISIBLE_DEVICES=${BATCH_CUDA_VISIBLE_DEVICES:-1}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DEVICE=cuda
+      - GPU_ENABLED=true
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - /mnt/video_archive:/mnt/video_archive:ro
+      - ./batch_processing/logs:/app/batch_processing/logs
+
+    restart: "no"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # Redis for caching (optional); host port 6380 to avoid conflict with existing Redis on 6379
+  redis:
+    image: redis:7-alpine
+    pull_policy: if_not_present
+    container_name: lsr-skud-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Monitoring with Prometheus (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    pull_policy: if_not_present
+    container_name: lsr-skud-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Grafana for visualization (optional); host port 3001 if 3000 is already in use
+  grafana:
+    image: grafana/grafana:latest
+    pull_policy: if_not_present
+    container_name: lsr-skud-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:

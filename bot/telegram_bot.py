@@ -2,6 +2,7 @@ import logging
 import re
 import asyncio
 import os
+import subprocess
 import threading
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -17,6 +18,39 @@ from training.manager import TrainingManager
 from gate.controller import GateController
 
 logger = logging.getLogger(__name__)
+
+# Admin group for logs, coordination and feedback (same as tech_chat_id in config)
+FEEDBACK_BUTTON_CALLBACK = "feedback:start"
+
+
+def _feedback_keyboard():
+    """Inline keyboard with single button: send next user message to admin group."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📩 Сообщить о проблеме / написать в админ-группу", callback_data=FEEDBACK_BUTTON_CALLBACK)]
+    ])
+
+
+def _get_git_info() -> Dict[str, str]:
+    """Get current git commit hash, subject and branch for startup notification."""
+    result = {}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for key, cmd in [
+        ("commit", ["git", "rev-parse", "HEAD"]),
+        ("subject", ["git", "log", "-1", "--pretty=%s"]),
+        ("branch", ["git", "branch", "--show-current"]),
+    ]:
+        try:
+            out = subprocess.run(
+                cmd, cwd=root, capture_output=True, text=True, timeout=2
+            )
+            if out.returncode == 0 and out.stdout:
+                result[key] = out.stdout.strip()
+            else:
+                result[key] = ""
+        except Exception:
+            result[key] = ""
+    return result
 
 
 class TelegramBot:
@@ -57,6 +91,9 @@ class TelegramBot:
         self._running = False
 
     async def start(self):
+        logger.info("Bot start() called, token=%s, proxy=%s",
+                    "set" if self.config.telegram_bot_token else "NOT SET",
+                    self.config.telegram_proxy_url or "none")
         if not self.config.telegram_bot_token:
             logger.warning("No Telegram bot token configured")
             return
@@ -68,8 +105,15 @@ class TelegramBot:
                 ApplicationBuilder, CommandHandler, MessageHandler,
                 CallbackQueryHandler, filters, ContextTypes
             )
+            from telegram.request import HTTPXRequest
 
-            app = ApplicationBuilder().token(self.config.telegram_bot_token).build()
+            builder = ApplicationBuilder().token(self.config.telegram_bot_token)
+            if self.config.telegram_proxy_url:
+                logger.info("Using Telegram proxy: %s", self.config.telegram_proxy_url)
+                builder = builder.request(HTTPXRequest(proxy=self.config.telegram_proxy_url))
+            else:
+                logger.warning("TELEGRAM_PROXY_URL not set - API calls may fail behind corporate proxy")
+            app = builder.build()
 
             app.add_handler(CommandHandler("start", self._cmd_start))
             app.add_handler(CommandHandler("help", self._cmd_help))
@@ -79,6 +123,7 @@ class TelegramBot:
             app.add_handler(MessageHandler(filters.CONTACT, self._handle_contact))
             app.add_handler(CallbackQueryHandler(self._handle_callback))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
+            app.add_error_handler(self._on_error)
 
             self._bot = app
             self._bot_loop = asyncio.get_event_loop()
@@ -88,11 +133,57 @@ class TelegramBot:
             await app.start()
             await app.updater.start_polling()
             logger.info("Telegram bot started")
+            await self._send_startup_notification()
 
-        except ImportError:
-            logger.error("python-telegram-bot not installed")
+        except ImportError as e:
+            logger.error("python-telegram-bot not installed: %s", e, exc_info=True)
         except Exception as e:
-            logger.error(f"Failed to start Telegram bot: {e}")
+            logger.error("Failed to start Telegram bot: %s", e, exc_info=True)
+
+    async def _on_error(self, update: object, context: Any) -> None:
+        """Log errors and notify admin group so there is feedback when something goes wrong."""
+        import traceback
+        logger.exception("Telegram bot error: %s", context.error)
+        if not self._bot or not self.config.tech_chat_id:
+            return
+        try:
+            err_msg = str(context.error) or "Unknown error"
+            short = err_msg[:400] + "…" if len(err_msg) > 400 else err_msg
+            text = (
+                "⚠️ Ошибка в боте\n\n"
+                f"{short}\n\n"
+                "Подробности в логах сервера. При повторении — напишите в эту группу."
+            )
+            await self._bot.bot.send_message(
+                chat_id=self.config.tech_chat_id,
+                text=text,
+            )
+        except Exception as e:
+            logger.warning("Could not send error to admin group: %s", e)
+
+    async def _send_startup_notification(self) -> None:
+        """Send reboot notification to admin group (tech_chat_id)."""
+        if not self._bot or not self.config.tech_chat_id:
+            return
+        try:
+            git = _get_git_info()
+            commit = git.get("commit", "")[:7] if git.get("commit") else "—"
+            subject = git.get("subject", "") or "—"
+            branch = git.get("branch", "") or "—"
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            text = (
+                "🔄 Бот был перезапущен\n\n"
+                f"🔖 Последний коммит: {commit}\n"
+                f"📝 Сообщение: {subject}\n"
+                f"🌿 Ветка: {branch}\n\n"
+                f"⏱️ Время запуска: {now}"
+            )
+            await self._bot.bot.send_message(
+                chat_id=self.config.tech_chat_id,
+                text=text,
+            )
+        except Exception as e:
+            logger.warning("Could not send startup notification: %s", e)
 
     async def stop(self):
         if self._bot and self._running:
@@ -151,38 +242,51 @@ class TelegramBot:
 
     async def _cmd_start(self, update, context):
         user_id = update.effective_user.id
+        chat = update.effective_chat
         user = self.db.get_user(user_id)
+
+        # In groups we cannot request phone — ask to open bot in private
+        if chat.type != "private":
+            await update.message.reply_text(
+                "Авторизация возможна только в личном чате с ботом.\n"
+                "Напишите боту в личные сообщения (Direct) и нажмите /start.\n\n"
+                "При проблемах нажмите кнопку ниже — ваше сообщение будет переслано в админ-группу.",
+                reply_markup=_feedback_keyboard(),
+            )
+            return
 
         if user and user.get("parsec_person_id"):
             await update.message.reply_text(
-                "Welcome back! You are authenticated.\n\n"
-                "Send a license plate number (e.g. А123ВС77) to create a vehicle pass.\n"
-                "Use /passes to view active passes.\n"
-                "Use /help for all commands."
+                "С возвращением! Вы уже авторизованы.\n\n"
+                "Отправьте номер авто (например А123ВС77), чтобы создать пропуск.\n"
+                "Команды: /passes — ваши пропуска, /set — группа доступа, /help — справка.\n\n"
+                "При проблемах нажмите кнопку ниже.",
+                reply_markup=_feedback_keyboard(),
             )
             return
 
         from telegram import KeyboardButton, ReplyKeyboardMarkup
-        button = KeyboardButton("📱 Share phone number", request_contact=True)
+        button = KeyboardButton("📱 Поделиться номером телефона", request_contact=True)
         reply_markup = ReplyKeyboardMarkup(
             [[button]], one_time_keyboard=True, resize_keyboard=True
         )
         await update.message.reply_text(
-            "Welcome to the Gate Control Bot!\n\n"
-            "Please share your phone number to authenticate with the Parsec system.",
+            "Добро пожаловать в бот контроля доступа!\n\n"
+            "Поделитесь номером телефона для авторизации в системе Parsec.",
             reply_markup=reply_markup,
         )
 
     async def _cmd_help(self, update, context):
         await update.message.reply_text(
-            "🚗 Gate Control Bot Commands:\n\n"
-            "/start - Start / authenticate\n"
-            "/passes - View your active passes\n"
-            "/set - Choose default access group\n"
-            "/cancel - Cancel a pass\n"
-            "/help - Show this help\n\n"
-            "Send a license plate number to create a vehicle pass.\n"
-            "Format: А123ВС77"
+            "🚗 Бот контроля доступа — команды:\n\n"
+            "/start — запуск и авторизация\n"
+            "/passes — ваши активные пропуска\n"
+            "/set — выбор группы доступа по умолчанию\n"
+            "/cancel — отмена пропуска\n"
+            "/help — эта справка\n\n"
+            "Отправьте номер авто (формат А123ВС77), чтобы создать пропуск.\n\n"
+            "При проблемах нажмите кнопку ниже.",
+            reply_markup=_feedback_keyboard(),
         )
 
     async def _cmd_passes(self, update, context):
@@ -190,10 +294,10 @@ class TelegramBot:
         passes = self.pass_handler.get_user_passes(user_id)
 
         if not passes:
-            await update.message.reply_text("You have no active passes.")
+            await update.message.reply_text("У вас нет активных пропусков.")
             return
 
-        text_parts = ["📋 Your active passes:\n"]
+        text_parts = ["📋 Ваши активные пропуска:\n"]
         for p in passes:
             ptype = "🚗" if p["pass_type"] == "vehicle" else "🔑"
             plate_info = f" ({p['plate_number']})" if p.get("plate_number") else ""
@@ -211,7 +315,7 @@ class TelegramBot:
 
         if not groups:
             await update.message.reply_text(
-                "No access groups available. Make sure you are authenticated."
+                "Нет доступных групп доступа. Сначала авторизуйтесь через /start."
             )
             return
 
@@ -223,7 +327,7 @@ class TelegramBot:
             )])
 
         await update.message.reply_text(
-            "Select your default access group:",
+            "Выберите группу доступа по умолчанию:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
@@ -232,7 +336,7 @@ class TelegramBot:
         passes = self.pass_handler.get_user_passes(user_id)
 
         if not passes:
-            await update.message.reply_text("You have no active passes to cancel.")
+            await update.message.reply_text("Нет активных пропусков для отмены.")
             return
 
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -248,7 +352,7 @@ class TelegramBot:
             )])
 
         await update.message.reply_text(
-            "Select a pass to cancel:",
+            "Выберите пропуск для отмены:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
@@ -263,14 +367,17 @@ class TelegramBot:
         if result["success"]:
             await update.message.reply_text(
                 f"✅ {result['message']}\n\n"
-                "Send a license plate number to create a vehicle pass.\n"
-                "Use /set to choose your access group.",
+                "Отправьте номер авто для создания пропуска. Команда /set — выбор группы доступа.",
                 reply_markup=ReplyKeyboardRemove(),
             )
         else:
             await update.message.reply_text(
-                f"❌ {result['message']}\n\nPlease try again or contact support.",
+                f"❌ {result['message']}\n\nПовторите попытку или нажмите кнопку ниже, чтобы написать в админ-группу.",
                 reply_markup=ReplyKeyboardRemove(),
+            )
+            await update.message.reply_text(
+                "При проблемах ваше сообщение перешлём в админ-группу.",
+                reply_markup=_feedback_keyboard(),
             )
 
     async def _handle_callback(self, update, context):
@@ -283,17 +390,17 @@ class TelegramBot:
             group_id = parts[1]
             group_name = parts[2] if len(parts) > 2 else ""
             self.db.set_default_access_group(user_id, group_id)
-            await query.answer(f"Default group set to: {group_name}")
-            await query.edit_message_text(f"✅ Default access group: {group_name}")
+            await query.answer(f"Группа по умолчанию: {group_name}")
+            await query.edit_message_text(f"✅ Группа доступа: {group_name}")
 
         elif data.startswith("cancel:"):
             pass_id = int(data.split(":")[1])
             success = self.pass_handler.cancel_pass(pass_id, user_id)
             if success:
-                await query.answer("Pass cancelled")
-                await query.edit_message_text(f"✅ Pass #{pass_id} cancelled")
+                await query.answer("Пропуск отменён")
+                await query.edit_message_text(f"✅ Пропуск #{pass_id} отменён")
             else:
-                await query.answer("Failed to cancel pass")
+                await query.answer("Не удалось отменить пропуск")
 
         elif data.startswith("duration:"):
             parts = data.split(":")
@@ -309,7 +416,15 @@ class TelegramBot:
                 )
                 self.user_states.pop(user_id, None)
             else:
-                await query.answer("Please send a plate number first")
+                await query.answer("Сначала отправьте номер авто")
+
+        elif data == FEEDBACK_BUTTON_CALLBACK:
+            self.user_states[user_id] = {"waiting_feedback": True}
+            await query.answer()
+            await query.message.reply_text(
+                "Опишите проблему или вопрос. Ваше следующее сообщение будет переслано в админ-группу."
+            )
+            return
 
         elif data.startswith("rv:"):
             chat_id = update.effective_chat.id
@@ -332,8 +447,31 @@ class TelegramBot:
     async def _handle_text(self, update, context):
         user_id = update.effective_user.id
         text = update.message.text.strip()
+        user_obj = update.effective_user
 
         state = self.user_states.get(user_id, {})
+        if state.get("waiting_feedback"):
+            self.user_states.pop(user_id, None)
+            if self.config.tech_chat_id and self._bot:
+                try:
+                    name = user_obj.full_name or "?"
+                    username = f"@{user_obj.username}" if user_obj.username else "—"
+                    admin_text = (
+                        f"📩 Сообщение от пользователя:\n"
+                        f"{name} (ID: {user_id}, {username})\n\n{text}"
+                    )
+                    await self._bot.bot.send_message(
+                        chat_id=self.config.tech_chat_id,
+                        text=admin_text,
+                    )
+                    await update.message.reply_text("✅ Сообщение доставлено в админ-группу.")
+                except Exception as e:
+                    logger.warning("Failed to forward feedback to admin group: %s", e)
+                    await update.message.reply_text("Не удалось отправить в админ-группу. Попробуйте позже.")
+            else:
+                await update.message.reply_text("Админ-группа не настроена. Обратитесь к администратору.")
+            return
+
         if state.get("waiting_ocr_correction"):
             event_id = state["event_id"]
             result = self.admin_handler.process_ocr_correction(event_id, text)
@@ -347,7 +485,7 @@ class TelegramBot:
         user = self.db.get_user(user_id)
         if not user:
             await update.message.reply_text(
-                "Please authenticate first. Use /start"
+                "Сначала авторизуйтесь: /start"
             )
             return
 
@@ -358,21 +496,21 @@ class TelegramBot:
 
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             keyboard = [
-                [InlineKeyboardButton("Until end of day", callback_data="duration:day_end")],
-                [InlineKeyboardButton("3 hours", callback_data="duration:3hours")],
-                [InlineKeyboardButton("24 hours", callback_data="duration:24hours")],
-                [InlineKeyboardButton("1 week", callback_data="duration:week")],
+                [InlineKeyboardButton("До конца дня", callback_data="duration:day_end")],
+                [InlineKeyboardButton("3 часа", callback_data="duration:3hours")],
+                [InlineKeyboardButton("24 часа", callback_data="duration:24hours")],
+                [InlineKeyboardButton("1 неделя", callback_data="duration:week")],
             ]
 
             await update.message.reply_text(
-                f"🚗 Creating pass for: {plate}\n\nSelect duration:",
+                f"🚗 Создание пропуска: {plate}\n\nВыберите срок:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
         else:
             await update.message.reply_text(
-                "I didn't recognize a license plate number.\n"
-                "Please send it in format: А123ВС77\n\n"
-                "Use /help for available commands."
+                "Не похоже на номер авто. Отправьте в формате А123ВС77.\n\n"
+                "Команда /help — справка по командам. При проблемах — кнопка ниже.",
+                reply_markup=_feedback_keyboard(),
             )
 
     def on_recognition_result(self, result):

@@ -10,16 +10,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-os.makedirs("data", exist_ok=True)
-os.makedirs("data/snapshots", exist_ok=True)
-os.makedirs("data/training", exist_ok=True)
-os.makedirs("models", exist_ok=True)
+for d in ("data", "data/snapshots", "data/training", "models"):
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
 
 _bot_instance = None
 _bot_loop = None
 
 
 def run_telegram_bot():
+    logger.info("run_telegram_bot() called")
     global _bot_instance, _bot_loop
     from bot.telegram_bot import TelegramBot
     _bot_instance = TelegramBot()
@@ -35,6 +37,8 @@ def run_telegram_bot():
 
 
 def run_recognition_pipeline():
+    logger.info("run_recognition_pipeline() called")
+    logger.info("Starting recognition pipeline...")
     from config import get_config
     from recognition.pipeline import RecognitionPipeline
     from db.database import get_db
@@ -42,7 +46,23 @@ def run_recognition_pipeline():
     config = get_config()
     db = get_db(config.db_path)
 
+    # If GPU requested but not available (e.g. in Docker without nvidia runtime), skip pipeline
+    if config.gpu_enabled or (config.device and "cuda" in config.device.lower()):
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                logger.warning(
+                    "GPU requested (GPU_ENABLED=true/DEVICE=cuda) but CUDA not available in this process. "
+                    "Recognition pipeline will NOT start. Bot will keep running. "
+                    "To fix: run container with NVIDIA runtime (nvidia-container-toolkit on host)."
+                )
+                return
+        except Exception as e:
+            logger.warning("Could not check CUDA availability: %s. Skipping recognition pipeline.", e)
+            return
+
     cameras = db.get_cameras(enabled_only=True)
+    logger.info(f"Found {len(cameras)} enabled cameras")
     if not cameras:
         logger.info("No cameras configured, recognition pipeline idle")
         return
@@ -83,7 +103,14 @@ def run_recognition_pipeline():
 
     while True:
         import time
-        time.sleep(60)
+        time.sleep(30)  # Update every 30 seconds
+
+        # Sync camera statuses to database
+        cam_status = pipeline.camera_manager.get_camera_status()
+        for cam_id, status_info in cam_status.items():
+            db_status = "online" if status_info["status"] == "online" else "offline"
+            db.update_camera_status(cam_id, db_status)
+
         cameras = db.get_cameras(enabled_only=True)
         current_ids = set(pipeline.camera_manager.cameras.keys())
         db_ids = {c["camera_id"] for c in cameras}
@@ -94,14 +121,19 @@ def run_recognition_pipeline():
 
 
 if __name__ == "__main__":
+    logger.info("Main block starting")
     bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    logger.info("Starting bot thread")
     bot_thread.start()
+    logger.info("Bot thread started")
 
     import time
     time.sleep(2)
 
+    logger.info("Creating recognition thread...")
     recognition_thread = threading.Thread(target=run_recognition_pipeline, daemon=True)
     recognition_thread.start()
+    logger.info("Recognition thread started")
 
     logger.info("All services started")
     try:

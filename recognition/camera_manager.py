@@ -10,10 +10,11 @@ logger = logging.getLogger(__name__)
 
 
 class CameraStream:
-    def __init__(self, camera_id: str, stream_url: str, name: str = ""):
+    def __init__(self, camera_id: str, stream_url: str, name: str = "", mask_path: str = ""):
         self.camera_id = camera_id
         self.stream_url = stream_url
         self.name = name or camera_id
+        self.mask_path = mask_path
         self.cap = None
         self.last_frame = None
         self.last_frame_time = None
@@ -97,8 +98,8 @@ class CameraManager:
         self._threads: Dict[str, threading.Thread] = {}
         self._on_frame_callback: Optional[Callable] = None
 
-    def add_camera(self, camera_id: str, stream_url: str, name: str = ""):
-        cam = CameraStream(camera_id, stream_url, name)
+    def add_camera(self, camera_id: str, stream_url: str, name: str = "", mask_path: str = ""):
+        cam = CameraStream(camera_id, stream_url, name, mask_path)
         self.cameras[camera_id] = cam
         logger.info(f"Camera added: {camera_id} ({name})")
 
@@ -127,8 +128,10 @@ class CameraManager:
         logger.info("Camera manager stopped")
 
     def _capture_loop(self, camera_id: str):
+        logger.info(f"Starting capture loop for camera {camera_id}")
         cam = self.cameras.get(camera_id)
         if not cam:
+            logger.error(f"Camera {camera_id} not found in capture loop")
             return
 
         reconnect_delay = 5

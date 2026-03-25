@@ -1,0 +1,106 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / editor
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# Documentation
+docs/_build/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.pid
+
+# Data files (exclude from image)
+data/snapshots/*
+!data/snapshots/.gitkeep
+detected_vehicles/*
+batch_processing/logs/*
+!batch_processing/logs/.gitkeep
+*.csv
+*.mp4
+*.issvd
+*.avi
+*.mkv
+
+# Model files (should be mounted or downloaded)
+models/*.pt
+models/*.torchscript
+!models/.gitkeep
+
+# Benchmarks and test outputs
+benchmark_results_*.json
+tests/outputs/*
+
+# Development files
+Makefile
+docker-compose.dev.yml
+.env.example
+
+# Documentation source (built docs should be copied separately)
+README.md
+docs/
+
+# Deployment configs (should be separate)
+deploy/
+k8s/
+helm/
