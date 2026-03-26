@@ -241,6 +241,15 @@ class Database:
                 )
             """)
 
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_roles (
+                    chat_id INTEGER PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    complex_name TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+
             # Indexes (on columns that exist in the base schema)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_passes_plate ON passes(plate_number)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_passes_status ON passes(status)")
@@ -822,6 +831,46 @@ class Database:
                 (parsec_person_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    # --- Chat roles (role per Telegram group) ---
+
+    def set_chat_role(self, chat_id: int, role: str,
+                      complex_name: str = None) -> bool:
+        """Назначить роль чату (guard/uk/training/admin)."""
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT INTO chat_roles (chat_id, role, complex_name)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    role = excluded.role,
+                    complex_name = COALESCE(excluded.complex_name, complex_name)
+            """, (chat_id, role, complex_name))
+            return True
+
+    def get_chat_role(self, chat_id: int) -> Optional[str]:
+        """Получить роль чата. Возвращает строку роли или None."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT role FROM chat_roles WHERE chat_id = ?",
+                (chat_id,)
+            ).fetchone()
+            return row["role"] if row else None
+
+    def get_chats_by_role(self, role: str) -> List[Dict]:
+        """Получить все чаты с указанной ролью."""
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM chat_roles WHERE role = ?", (role,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def remove_chat_role(self, chat_id: int) -> bool:
+        """Удалить роль чата."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM chat_roles WHERE chat_id = ?", (chat_id,)
+            )
+            return cursor.rowcount > 0
 
     # --- Extended pass creation ---
 

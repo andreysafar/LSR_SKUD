@@ -21,8 +21,7 @@ INCIDENT_TYPES = {
     "other": "Прочее",
 }
 
-_GUARD_ROLE = "GuardOperator"
-_ACCESS_DENIED_MSG = "Доступ запрещён: недостаточно прав (роль охранника не подтверждена)."
+_ACCESS_DENIED_MSG = "Доступ запрещён: этот чат не зарегистрирован как группа охраны."
 
 
 class GuardHandler:
@@ -30,26 +29,20 @@ class GuardHandler:
         self.db = db
         self.parsec = parsec_api
 
-    def _verify_guard_role(self, session_id: str) -> Optional[str]:
-        """Проверка роли охранника через Parsec.
+    def _verify_guard_role(self, chat_id: int) -> Optional[str]:
+        """Проверка роли чата — должен быть зарегистрирован как 'guard'.
 
         Returns:
             None if verification passed, error message string otherwise.
         """
-        if not self.parsec:
-            return "Parsec API не настроен, проверка роли невозможна."
-        try:
-            is_guard = self.parsec.check_role(session_id, _GUARD_ROLE)
-        except Exception as e:
-            logger.error(f"CheckRole failed: {e}")
-            return "Ошибка проверки роли. Попробуйте позже."
-        if not is_guard:
+        role = self.db.get_chat_role(chat_id)
+        if role != "guard":
             return _ACCESS_DENIED_MSG
         return None
 
-    def get_duty_status(self, session_id: str) -> Dict:
+    def get_duty_status(self, chat_id: int) -> Dict:
         """Текущее состояние для начала смены."""
-        error = self._verify_guard_role(session_id)
+        error = self._verify_guard_role(chat_id)
         if error:
             return {"error": error}
 
@@ -106,10 +99,10 @@ class GuardHandler:
 
         return "\n".join(lines)
 
-    def get_active_passes_list(self, session_id: str,
+    def get_active_passes_list(self, chat_id: int,
                                subtype: str = None) -> List[Dict]:
         """Список активных пропусков с деталями для охраны."""
-        error = self._verify_guard_role(session_id)
+        error = self._verify_guard_role(chat_id)
         if error:
             return [{"error": error}]
 
@@ -183,10 +176,10 @@ class GuardHandler:
 
         return "\n".join(lines)
 
-    def get_journal(self, session_id: str, limit: int = 30,
+    def get_journal(self, chat_id: int, limit: int = 30,
                     date_from: str = None) -> List[Dict]:
         """Журнал въезда/выезда для охраны (только чтение)."""
-        error = self._verify_guard_role(session_id)
+        error = self._verify_guard_role(chat_id)
         if error:
             return [{"error": error}]
 
@@ -224,12 +217,12 @@ class GuardHandler:
 
         return "\n".join(lines)
 
-    def create_incident(self, session_id: str, incident_type: str,
+    def create_incident(self, chat_id: int, incident_type: str,
                          description: str, plate_number: str = None,
                          apartment: str = None,
                          reported_by_user_id: int = None) -> Dict:
         """Фиксация инцидента охраной."""
-        error = self._verify_guard_role(session_id)
+        error = self._verify_guard_role(chat_id)
         if error:
             return {"error": error}
 
@@ -244,5 +237,5 @@ class GuardHandler:
         logger.info(f"Incident created: type={incident_type}, id={incident_id}")
         return {"incident_id": incident_id}
 
-    def get_incident_types(self) -> Dict[str, str]:
+    def format_incident_types(self) -> Dict[str, str]:
         return INCIDENT_TYPES

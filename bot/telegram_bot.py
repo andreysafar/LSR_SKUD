@@ -135,12 +135,15 @@ class TelegramBot:
             app.add_handler(CallbackQueryHandler(self._handle_callback))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
 
-            # Guard commands
+            # Admin: register chat role
+            app.add_handler(CommandHandler("register_chat", self._cmd_register_chat))
+
+            # Guard commands (work in chats with role='guard')
             app.add_handler(CommandHandler("duty", self._cmd_duty))
             app.add_handler(CommandHandler("journal", self._cmd_journal))
             app.add_handler(CommandHandler("incident", self._cmd_incident))
 
-            # Management commands
+            # Management commands (work in chats with role='uk')
             app.add_handler(CommandHandler("blacklist", self._cmd_blacklist))
             app.add_handler(CommandHandler("incidents", self._cmd_incidents))
 
@@ -158,13 +161,28 @@ class TelegramBot:
 
             # Start notification scheduler
             try:
+                # Resolve guard/uk chat IDs: config override or first registered chat
+                guard_cid = self._guard_chat_id
+                uk_cid = self._uk_chat_id
+                if not guard_cid:
+                    guard_chats = self.db.get_chats_by_role("guard")
+                    if guard_chats:
+                        guard_cid = guard_chats[0]["chat_id"]
+                if not uk_cid:
+                    uk_chats = self.db.get_chats_by_role("uk")
+                    if uk_chats:
+                        uk_cid = uk_chats[0]["chat_id"]
+
                 self.notification_scheduler = NotificationScheduler(
                     send_message_callback=self._bot.bot.send_message,
-                    guard_chat_id=self._guard_chat_id,
-                    uk_chat_id=self._uk_chat_id,
+                    guard_chat_id=guard_cid,
+                    uk_chat_id=uk_cid,
+                    parsec_api=self.parsec,
                 )
                 self.notification_scheduler.start()
-                logger.info("NotificationScheduler started")
+                # Wire into gate controller
+                self.gate_controller.notification_scheduler = self.notification_scheduler
+                logger.info("NotificationScheduler started (guard=%s, uk=%s)", guard_cid, uk_cid)
             except Exception as e:
                 logger.error("Failed to start NotificationScheduler: %s", e)
 
@@ -327,6 +345,7 @@ class TelegramBot:
             "/incident — создать инцидент (охрана)\n"
             "/blacklist — чёрный список (УК)\n"
             "/incidents — инциденты (УК)\n\n"
+            "/register_chat — зарегистрировать чат (админ)\n\n"
             "Отправьте номер авто (формат А123ВС77), чтобы создать пропуск.\n\n"
             "При проблемах нажмите кнопку ниже.",
             reply_markup=_feedback_keyboard(),
@@ -399,42 +418,78 @@ class TelegramBot:
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
-    def _get_parsec_session(self, user_id: int) -> Optional[str]:
-        """Get or create Parsec session for user operations."""
-        if not self.parsec:
-            return None
-        try:
-            return self.parsec.get_bot_session_id()
-        except Exception as e:
-            logger.error("Failed to get Parsec session for user %s: %s", user_id, e)
-            return None
+    async def _cmd_register_chat(self, update, context):
+        """Admin: register chat role. Usage: /register_chat <role> [complex_name]
+        Roles: guard, uk, training, admin"""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        # Only admin (tech_chat_id members or is_admin users) can register
+        user = self.db.get_user(user_id)
+        is_admin = (user and user.get("is_admin")) or (
+            chat_id == self.config.tech_chat_id
+        )
+        if not is_admin:
+            await update.message.reply_text("❌ Только администратор может регистрировать чаты.")
+            return
+
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "Использование: /register_chat <роль> [название ЖК]\n\n"
+                "Роли:\n"
+                "  guard — группа охраны\n"
+                "  uk — группа управляющей компании\n"
+                "  training — группа для дообучения моделей\n"
+                "  admin — административная группа"
+            )
+            return
+
+        role = args[0].lower()
+        if role not in ("guard", "uk", "training", "admin"):
+            await update.message.reply_text(f"❌ Неизвестная роль: {role}")
+            return
+
+        complex_name = " ".join(args[1:]) if len(args) > 1 else None
+        self.db.set_chat_role(chat_id, role, complex_name)
+
+        # Update notification scheduler chat IDs dynamically
+        if self.notification_scheduler:
+            if role == "guard" and not self.notification_scheduler.guard_chat_id:
+                self.notification_scheduler.guard_chat_id = chat_id
+            elif role == "uk" and not self.notification_scheduler.uk_chat_id:
+                self.notification_scheduler.uk_chat_id = chat_id
+
+        name_text = f" ({complex_name})" if complex_name else ""
+        await update.message.reply_text(
+            f"✅ Чат зарегистрирован как '{role}'{name_text}.\n"
+            f"Chat ID: {chat_id}"
+        )
 
     async def _cmd_duty(self, update, context):
         """Guard: show duty status (vehicles, active passes, incidents)."""
-        user_id = update.effective_user.id
-        session_id = self._get_parsec_session(user_id)
-        result = self.guard_handler.get_duty_status(session_id)
-        if not result.get("success", False):
-            await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+        chat_id = update.effective_chat.id
+        result = self.guard_handler.get_duty_status(chat_id)
+        if "error" in result:
+            await update.message.reply_text(f"❌ {result['error']}")
             return
-        text = self.guard_handler.format_duty_status(result["data"])
+        text = self.guard_handler.format_duty_status(result)
         await update.message.reply_text(text)
 
     async def _cmd_journal(self, update, context):
         """Guard: show entry/exit journal."""
-        user_id = update.effective_user.id
-        session_id = self._get_parsec_session(user_id)
-        result = self.guard_handler.get_journal(session_id)
-        if not result.get("success", False):
-            await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+        chat_id = update.effective_chat.id
+        result = self.guard_handler.get_journal(chat_id)
+        if result and len(result) == 1 and "error" in result[0]:
+            await update.message.reply_text(f"❌ {result[0]['error']}")
             return
-        text = self.guard_handler.format_journal(result["data"])
+        text = self.guard_handler.format_journal(result)
         await update.message.reply_text(text)
 
     async def _cmd_incident(self, update, context):
         """Guard: create incident. Usage: /incident <type> <description>"""
+        chat_id = update.effective_chat.id
         user_id = update.effective_user.id
-        session_id = self._get_parsec_session(user_id)
 
         args = context.args or []
         if len(args) < 2:
@@ -450,28 +505,27 @@ class TelegramBot:
         description = " ".join(args[1:])
 
         result = self.guard_handler.create_incident(
-            session_id=session_id,
+            chat_id=chat_id,
             incident_type=incident_type,
             description=description,
             plate_number=None,
             apartment=None,
             reported_by_user_id=user_id,
         )
-        if result.get("success"):
-            await update.message.reply_text(f"✅ {result['message']}")
+        if result.get("incident_id"):
+            await update.message.reply_text(f"✅ Инцидент #{result['incident_id']} создан.")
         else:
-            await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+            await update.message.reply_text(f"❌ {result.get('error', 'Ошибка')}")
 
     async def _cmd_blacklist(self, update, context):
         """Management: blacklist operations. Usage: /blacklist [add|remove|list]"""
-        user_id = update.effective_user.id
-        session_id = self._get_parsec_session(user_id)
+        chat_id = update.effective_chat.id
 
         args = context.args or []
         action = args[0] if args else "list"
 
         if action == "list":
-            result = self.management_handler.get_blacklist(session_id)
+            result = self.management_handler.get_blacklist(chat_id)
             if result.get("success"):
                 text = self.management_handler.format_blacklist(result["data"])
                 await update.message.reply_text(text)
@@ -480,7 +534,7 @@ class TelegramBot:
 
         elif action == "add" and len(args) >= 2:
             parsec_person_id = args[1]
-            result = self.management_handler.add_to_blacklist(session_id, parsec_person_id)
+            result = self.management_handler.add_to_blacklist(chat_id, parsec_person_id)
             if result.get("success"):
                 await update.message.reply_text(f"✅ {result['message']}")
             else:
@@ -488,7 +542,7 @@ class TelegramBot:
 
         elif action == "remove" and len(args) >= 2:
             parsec_person_id = args[1]
-            result = self.management_handler.remove_from_blacklist(session_id, parsec_person_id)
+            result = self.management_handler.remove_from_blacklist(chat_id, parsec_person_id)
             if result.get("success"):
                 await update.message.reply_text(f"✅ {result['message']}")
             else:
@@ -504,8 +558,7 @@ class TelegramBot:
 
     async def _cmd_incidents(self, update, context):
         """Management: view/resolve incidents. Usage: /incidents [resolve <id> <resolution>]"""
-        user_id = update.effective_user.id
-        session_id = self._get_parsec_session(user_id)
+        chat_id = update.effective_chat.id
 
         args = context.args or []
 
@@ -516,13 +569,13 @@ class TelegramBot:
                 await update.message.reply_text("❌ Неверный ID инцидента")
                 return
             resolution = " ".join(args[2:])
-            result = self.management_handler.resolve_incident(session_id, incident_id, resolution)
+            result = self.management_handler.resolve_incident(chat_id, incident_id, resolution)
             if result.get("success"):
                 await update.message.reply_text(f"✅ {result['message']}")
             else:
                 await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
         else:
-            result = self.management_handler.get_incidents(session_id, resolved=False)
+            result = self.management_handler.get_incidents(chat_id, resolved=False)
             if result.get("success"):
                 text = self.management_handler.format_incidents(result["data"])
                 await update.message.reply_text(text)

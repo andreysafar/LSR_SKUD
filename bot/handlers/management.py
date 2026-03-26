@@ -13,8 +13,7 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_MANAGEMENT_ROLE = "EmployeeWriter"
-_ACCESS_DENIED_MSG = "Доступ запрещён: недостаточно прав (роль управляющей компании не подтверждена)."
+_ACCESS_DENIED_MSG = "Доступ запрещён: этот чат не зарегистрирован как группа УК."
 
 INCIDENT_TYPE_NAMES = {
     "parking_violation": "Парковка в проезде",
@@ -36,38 +35,30 @@ VIOLATION_TYPE_NAMES = {
 class ManagementHandler:
     """Handler for Management Company (УК) operations."""
 
-    ROLE_NAME = "EmployeeWriter"  # Parsec role for management
-
     def __init__(self, db, parsec=None):
         self.db = db
         self.parsec = parsec
 
-    def _verify_management_role(self, session_id: str) -> Optional[str]:
-        """Проверка роли сотрудника УК через Parsec.
+    def _verify_management_role(self, chat_id: int) -> Optional[str]:
+        """Проверка роли чата — должен быть зарегистрирован как 'uk'.
 
         Returns:
             None если проверка прошла успешно, иначе строка с ошибкой.
         """
-        if not self.parsec:
-            return "Parsec API не настроен, проверка роли невозможна."
-        try:
-            is_management = self.parsec.check_role(session_id, _MANAGEMENT_ROLE)
-        except Exception as e:
-            logger.error(f"CheckRole failed: {e}")
-            return "Ошибка проверки роли. Попробуйте позже."
-        if not is_management:
+        role = self.db.get_chat_role(chat_id)
+        if role != "uk":
             return _ACCESS_DENIED_MSG
         return None
 
     # --- Blacklist operations ---
 
-    def get_blacklist(self, session_id: str, limit: int = 50) -> Dict:
+    def get_blacklist(self, chat_id: int, limit: int = 50) -> Dict:
         """Получить список нарушителей из чёрного списка.
 
         Returns:
             {"success": bool, "data": list, "message": str}
         """
-        error = self._verify_management_role(session_id)
+        error = self._verify_management_role(chat_id)
         if error:
             return {"success": False, "data": [], "message": error}
 
@@ -82,14 +73,14 @@ class ManagementHandler:
             logger.error(f"get_blacklist failed: {e}")
             return {"success": False, "data": [], "message": "Ошибка получения чёрного списка."}
 
-    def add_to_blacklist(self, session_id: str, parsec_person_id: str,
+    def add_to_blacklist(self, chat_id: int, parsec_person_id: str,
                          user_id: int = None) -> Dict:
         """Добавить жителя в чёрный список. При наличии Parsec API блокирует персону.
 
         Returns:
             {"success": bool, "message": str}
         """
-        error = self._verify_management_role(session_id)
+        error = self._verify_management_role(chat_id)
         if error:
             return {"success": False, "message": error}
 
@@ -124,13 +115,13 @@ class ManagementHandler:
             "message": f"Житель {parsec_person_id} добавлен в чёрный список.",
         }
 
-    def remove_from_blacklist(self, session_id: str, parsec_person_id: str) -> Dict:
+    def remove_from_blacklist(self, chat_id: int, parsec_person_id: str) -> Dict:
         """Удалить жителя из чёрного списка. При наличии Parsec API разблокирует персону.
 
         Returns:
             {"success": bool, "message": str}
         """
-        error = self._verify_management_role(session_id)
+        error = self._verify_management_role(chat_id)
         if error:
             return {"success": False, "message": error}
 
@@ -169,14 +160,14 @@ class ManagementHandler:
 
     # --- Incident operations ---
 
-    def get_incidents(self, session_id: str, resolved: bool = None,
+    def get_incidents(self, chat_id: int, resolved: bool = None,
                       limit: int = 50) -> Dict:
         """Получить список инцидентов.
 
         Returns:
             {"success": bool, "data": list, "message": str}
         """
-        error = self._verify_management_role(session_id)
+        error = self._verify_management_role(chat_id)
         if error:
             return {"success": False, "data": [], "message": error}
 
@@ -196,14 +187,14 @@ class ManagementHandler:
             logger.error(f"get_incidents failed: {e}")
             return {"success": False, "data": [], "message": "Ошибка получения инцидентов."}
 
-    def resolve_incident(self, session_id: str, incident_id: int,
+    def resolve_incident(self, chat_id: int, incident_id: int,
                          resolution: str) -> Dict:
         """Закрыть инцидент с указанием решения.
 
         Returns:
             {"success": bool, "message": str}
         """
-        error = self._verify_management_role(session_id)
+        error = self._verify_management_role(chat_id)
         if error:
             return {"success": False, "message": error}
 
