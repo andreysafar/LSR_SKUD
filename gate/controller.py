@@ -9,11 +9,13 @@ logger = logging.getLogger(__name__)
 
 
 class GateController:
-    def __init__(self, parsec_api: Optional[ParsecAPI] = None, notification_scheduler=None):
+    def __init__(self, parsec_api: Optional[ParsecAPI] = None, notification_scheduler=None,
+                 tag_cache=None):
         self.parsec = parsec_api
         self.db = get_db()
         self._session_id = None
         self.notification_scheduler = notification_scheduler
+        self.tag_cache = tag_cache
 
     def _ensure_session(self) -> Optional[str]:
         if self._session_id:
@@ -273,6 +275,18 @@ class GateController:
             "expected_plates": [],
             "person_id": None,
         }
+
+        # Try cache first
+        if self.tag_cache:
+            cached_plates = self.tag_cache.get_plates_for_tag(tag_code)
+            if cached_plates is not None:
+                result["expected_plates"] = list(cached_plates)
+                result["person_id"] = self.tag_cache.get_person_for_tag(tag_code)
+                plate_clean = plate_number.upper().replace(" ", "")
+                result["match"] = plate_clean in cached_plates
+                if not result["match"]:
+                    logger.warning(f"Tag-plate mismatch (cached): tag={tag_code}, detected={plate_clean}, expected={cached_plates}")
+                return result
 
         if not self.parsec or not self.parsec.host:
             return result

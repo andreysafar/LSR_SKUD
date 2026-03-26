@@ -823,6 +823,14 @@ class Database:
                 """, (owner_parsec_id,))
             return cursor.rowcount
 
+    def get_all_users(self, limit: int = 500) -> List[Dict]:
+        """Получить всех пользователей (для панели УК)."""
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_user_by_parsec_id(self, parsec_person_id: str) -> Optional[Dict]:
         """Поиск пользователя по parsec_person_id."""
         with self.get_connection() as conn:

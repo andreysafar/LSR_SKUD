@@ -313,6 +313,30 @@ class ParsecAPI:
             logger.error(f"GetPersonIdentifiers error: {e}")
             return []
 
+    def get_all_identifiers(self, session_id: str) -> Optional[List[Dict]]:
+        """Get all identifiers (tags + plates) across all persons.
+        Returns None if the bulk API is not available."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return None
+            result = client.service.GetAllIdentifiers(session_id)
+            if not result or getattr(result, 'Result', -1) != 0:
+                return None
+            identifiers = []
+            for item in getattr(result, 'IdentifiersList', []):
+                identifiers.append({
+                    "id": getattr(item, 'ID', ''),
+                    "person_id": getattr(item, 'PersonID', ''),
+                    "code": getattr(item, 'Code', ''),
+                    "name": getattr(item, 'Name', ''),
+                    "identif_type": getattr(item, 'IdentifType', -1),
+                })
+            return identifiers
+        except Exception as e:
+            logger.warning(f"get_all_identifiers not available: {e}")
+            return None
+
     def open_person_editing_session(self, session_id: str, person_id: str) -> Optional[str]:
         try:
             client = self._ensure_client()
