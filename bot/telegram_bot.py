@@ -16,6 +16,9 @@ from bot.handlers.admin import AdminHandler
 from training.collector import TrainingCollector
 from training.manager import TrainingManager
 from gate.controller import GateController
+from bot.handlers.guard import GuardHandler
+from bot.handlers.management import ManagementHandler
+from notifications.scheduler import NotificationScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,14 @@ class TelegramBot:
         )
 
         self.gate_controller = GateController(self.parsec)
+        self.guard_handler = GuardHandler(self.db, self.parsec)
+        self.management_handler = ManagementHandler(self.db, self.parsec)
+
+        # Notification scheduler - wired after bot starts
+        self.notification_scheduler = None
+        # Chat IDs for guard and management company notifications
+        self._guard_chat_id = getattr(self.config, 'guard_chat_id', None)
+        self._uk_chat_id = getattr(self.config, 'uk_chat_id', None)
 
         self.user_states: Dict[int, Dict[str, Any]] = {}
         self._bot = None
@@ -123,6 +134,19 @@ class TelegramBot:
             app.add_handler(MessageHandler(filters.CONTACT, self._handle_contact))
             app.add_handler(CallbackQueryHandler(self._handle_callback))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
+
+            # Admin: register chat role
+            app.add_handler(CommandHandler("register_chat", self._cmd_register_chat))
+
+            # Guard commands (work in chats with role='guard')
+            app.add_handler(CommandHandler("duty", self._cmd_duty))
+            app.add_handler(CommandHandler("journal", self._cmd_journal))
+            app.add_handler(CommandHandler("incident", self._cmd_incident))
+
+            # Management commands (work in chats with role='uk')
+            app.add_handler(CommandHandler("blacklist", self._cmd_blacklist))
+            app.add_handler(CommandHandler("incidents", self._cmd_incidents))
+
             app.add_error_handler(self._on_error)
 
             self._bot = app
@@ -134,6 +158,33 @@ class TelegramBot:
             await app.updater.start_polling()
             logger.info("Telegram bot started")
             await self._send_startup_notification()
+
+            # Start notification scheduler
+            try:
+                # Resolve guard/uk chat IDs: config override or first registered chat
+                guard_cid = self._guard_chat_id
+                uk_cid = self._uk_chat_id
+                if not guard_cid:
+                    guard_chats = self.db.get_chats_by_role("guard")
+                    if guard_chats:
+                        guard_cid = guard_chats[0]["chat_id"]
+                if not uk_cid:
+                    uk_chats = self.db.get_chats_by_role("uk")
+                    if uk_chats:
+                        uk_cid = uk_chats[0]["chat_id"]
+
+                self.notification_scheduler = NotificationScheduler(
+                    send_message_callback=self._bot.bot.send_message,
+                    guard_chat_id=guard_cid,
+                    uk_chat_id=uk_cid,
+                    parsec_api=self.parsec,
+                )
+                self.notification_scheduler.start()
+                # Wire into gate controller
+                self.gate_controller.notification_scheduler = self.notification_scheduler
+                logger.info("NotificationScheduler started (guard=%s, uk=%s)", guard_cid, uk_cid)
+            except Exception as e:
+                logger.error("Failed to start NotificationScheduler: %s", e)
 
         except ImportError as e:
             logger.error("python-telegram-bot not installed: %s", e, exc_info=True)
@@ -187,6 +238,11 @@ class TelegramBot:
 
     async def stop(self):
         if self._bot and self._running:
+            if self.notification_scheduler:
+                try:
+                    self.notification_scheduler.shutdown(wait=False)
+                except Exception as e:
+                    logger.error("Error shutting down NotificationScheduler: %s", e)
             try:
                 await self._bot.updater.stop()
                 await self._bot.stop()
@@ -284,6 +340,12 @@ class TelegramBot:
             "/set — выбор группы доступа по умолчанию\n"
             "/cancel — отмена пропуска\n"
             "/help — эта справка\n\n"
+            "/duty — статус дежурства (охрана)\n"
+            "/journal — журнал въезда/выезда (охрана)\n"
+            "/incident — создать инцидент (охрана)\n"
+            "/blacklist — чёрный список (УК)\n"
+            "/incidents — инциденты (УК)\n\n"
+            "/register_chat — зарегистрировать чат (админ)\n\n"
             "Отправьте номер авто (формат А123ВС77), чтобы создать пропуск.\n\n"
             "При проблемах нажмите кнопку ниже.",
             reply_markup=_feedback_keyboard(),
@@ -356,6 +418,170 @@ class TelegramBot:
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
+    async def _cmd_register_chat(self, update, context):
+        """Admin: register chat role. Usage: /register_chat <role> [complex_name]
+        Roles: guard, uk, training, admin"""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        # Only admin (tech_chat_id members or is_admin users) can register
+        user = self.db.get_user(user_id)
+        is_admin = (user and user.get("is_admin")) or (
+            chat_id == self.config.tech_chat_id
+        )
+        if not is_admin:
+            await update.message.reply_text("❌ Только администратор может регистрировать чаты.")
+            return
+
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "Использование: /register_chat <роль> [название ЖК]\n\n"
+                "Роли:\n"
+                "  guard — группа охраны\n"
+                "  uk — группа управляющей компании\n"
+                "  training — группа для дообучения моделей\n"
+                "  admin — административная группа"
+            )
+            return
+
+        role = args[0].lower()
+        if role not in ("guard", "uk", "training", "admin"):
+            await update.message.reply_text(f"❌ Неизвестная роль: {role}")
+            return
+
+        complex_name = " ".join(args[1:]) if len(args) > 1 else None
+        self.db.set_chat_role(chat_id, role, complex_name)
+
+        # Update notification scheduler chat IDs dynamically
+        if self.notification_scheduler:
+            if role == "guard" and not self.notification_scheduler.guard_chat_id:
+                self.notification_scheduler.guard_chat_id = chat_id
+            elif role == "uk" and not self.notification_scheduler.uk_chat_id:
+                self.notification_scheduler.uk_chat_id = chat_id
+
+        name_text = f" ({complex_name})" if complex_name else ""
+        await update.message.reply_text(
+            f"✅ Чат зарегистрирован как '{role}'{name_text}.\n"
+            f"Chat ID: {chat_id}"
+        )
+
+    async def _cmd_duty(self, update, context):
+        """Guard: show duty status (vehicles, active passes, incidents)."""
+        chat_id = update.effective_chat.id
+        result = self.guard_handler.get_duty_status(chat_id)
+        if "error" in result:
+            await update.message.reply_text(f"❌ {result['error']}")
+            return
+        text = self.guard_handler.format_duty_status(result)
+        await update.message.reply_text(text)
+
+    async def _cmd_journal(self, update, context):
+        """Guard: show entry/exit journal."""
+        chat_id = update.effective_chat.id
+        result = self.guard_handler.get_journal(chat_id)
+        if result and len(result) == 1 and "error" in result[0]:
+            await update.message.reply_text(f"❌ {result[0]['error']}")
+            return
+        text = self.guard_handler.format_journal(result)
+        await update.message.reply_text(text)
+
+    async def _cmd_incident(self, update, context):
+        """Guard: create incident. Usage: /incident <type> <description>"""
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+
+        args = context.args or []
+        if len(args) < 2:
+            types = self.guard_handler.format_incident_types()
+            types_text = "\n".join(f"  {k} — {v}" for k, v in types.items())
+            await update.message.reply_text(
+                f"Использование: /incident <тип> <описание>\n\n"
+                f"Типы инцидентов:\n{types_text}"
+            )
+            return
+
+        incident_type = args[0]
+        description = " ".join(args[1:])
+
+        result = self.guard_handler.create_incident(
+            chat_id=chat_id,
+            incident_type=incident_type,
+            description=description,
+            plate_number=None,
+            apartment=None,
+            reported_by_user_id=user_id,
+        )
+        if result.get("incident_id"):
+            await update.message.reply_text(f"✅ Инцидент #{result['incident_id']} создан.")
+        else:
+            await update.message.reply_text(f"❌ {result.get('error', 'Ошибка')}")
+
+    async def _cmd_blacklist(self, update, context):
+        """Management: blacklist operations. Usage: /blacklist [add|remove|list]"""
+        chat_id = update.effective_chat.id
+
+        args = context.args or []
+        action = args[0] if args else "list"
+
+        if action == "list":
+            result = self.management_handler.get_blacklist(chat_id)
+            if result.get("success"):
+                text = self.management_handler.format_blacklist(result["data"])
+                await update.message.reply_text(text)
+            else:
+                await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+
+        elif action == "add" and len(args) >= 2:
+            parsec_person_id = args[1]
+            result = self.management_handler.add_to_blacklist(chat_id, parsec_person_id)
+            if result.get("success"):
+                await update.message.reply_text(f"✅ {result['message']}")
+            else:
+                await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+
+        elif action == "remove" and len(args) >= 2:
+            parsec_person_id = args[1]
+            result = self.management_handler.remove_from_blacklist(chat_id, parsec_person_id)
+            if result.get("success"):
+                await update.message.reply_text(f"✅ {result['message']}")
+            else:
+                await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+
+        else:
+            await update.message.reply_text(
+                "Использование:\n"
+                "/blacklist — список заблокированных\n"
+                "/blacklist add <parsec_id> — добавить в ЧС\n"
+                "/blacklist remove <parsec_id> — удалить из ЧС"
+            )
+
+    async def _cmd_incidents(self, update, context):
+        """Management: view/resolve incidents. Usage: /incidents [resolve <id> <resolution>]"""
+        chat_id = update.effective_chat.id
+
+        args = context.args or []
+
+        if args and args[0] == "resolve" and len(args) >= 3:
+            try:
+                incident_id = int(args[1])
+            except ValueError:
+                await update.message.reply_text("❌ Неверный ID инцидента")
+                return
+            resolution = " ".join(args[2:])
+            result = self.management_handler.resolve_incident(chat_id, incident_id, resolution)
+            if result.get("success"):
+                await update.message.reply_text(f"✅ {result['message']}")
+            else:
+                await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+        else:
+            result = self.management_handler.get_incidents(chat_id, resolved=False)
+            if result.get("success"):
+                text = self.management_handler.format_incidents(result["data"])
+                await update.message.reply_text(text)
+            else:
+                await update.message.reply_text(f"❌ {result.get('message', 'Ошибка')}")
+
     async def _handle_contact(self, update, context):
         user_id = update.effective_user.id
         contact = update.message.contact
@@ -402,21 +628,133 @@ class TelegramBot:
             else:
                 await query.answer("Не удалось отменить пропуск")
 
+        elif data.startswith("type:"):
+            pass_type = data.split(":")[1]
+            state = self.user_states.get(user_id, {})
+            plate = state.get("plate")
+            if not plate:
+                await query.answer("Сначала отправьте номер авто")
+                return
+
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            if pass_type == "loading":
+                user = self.db.get_user(user_id)
+                access_group_id = user.get("default_access_group") if user else None
+                result = self.pass_handler.create_loading_pass(
+                    user_id, plate, access_group_id=access_group_id
+                )
+                await query.answer(result["message"][:200])
+                await query.edit_message_text(
+                    f"✅ {result['message']}" if result["success"]
+                    else f"❌ {result['message']}"
+                )
+                # Schedule loading pass notifications
+                if result.get("success") and self.notification_scheduler and result.get("pass_data"):
+                    pass_data = result["pass_data"]
+                    self.notification_scheduler.schedule_loading_pass_notifications(
+                        pass_id=pass_data.get("id", 0),
+                        owner_user_id=user_id,
+                        plate_number=plate,
+                        created_at_str=pass_data.get("valid_from", ""),
+                    )
+                self.user_states.pop(user_id, None)
+
+            elif pass_type == "guest":
+                spots = self.pass_handler.get_user_parking_spots(user_id)
+                if not spots:
+                    await query.answer("У вас нет привязанных м/м")
+                    await query.edit_message_text(
+                        "❌ У вас нет привязанных машиномест. "
+                        "Гостевой пропуск невозможен."
+                    )
+                    self.user_states.pop(user_id, None)
+                    return
+                self.user_states[user_id] = {"plate": plate, "type": "guest"}
+                keyboard = []
+                for s in spots:
+                    label = s.get("name") or s.get("number") or f"М/м #{s['id']}"
+                    keyboard.append([InlineKeyboardButton(
+                        label, callback_data=f"spot:{s['id']}"
+                    )])
+                await query.edit_message_text(
+                    f"🚗 Гостевой пропуск: {plate}\n\nВыберите машиноместо:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+
+            elif pass_type == "regular":
+                self.user_states[user_id] = {"plate": plate, "type": "regular"}
+                keyboard = [
+                    [InlineKeyboardButton("До конца дня", callback_data="duration:day_end")],
+                    [InlineKeyboardButton("3 часа", callback_data="duration:3hours")],
+                    [InlineKeyboardButton("24 часа", callback_data="duration:24hours")],
+                    [InlineKeyboardButton("1 неделя", callback_data="duration:week")],
+                ]
+                await query.edit_message_text(
+                    f"🚗 Обычный пропуск: {plate}\n\nВыберите срок:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+
+        elif data.startswith("spot:"):
+            spot_id = int(data.split(":")[1])
+            state = self.user_states.get(user_id, {})
+            plate = state.get("plate")
+            if not plate:
+                await query.answer("Сначала отправьте номер авто")
+                return
+
+            self.user_states[user_id] = {
+                "plate": plate, "type": "guest", "spot_id": spot_id
+            }
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            keyboard = [
+                [InlineKeyboardButton("До конца дня", callback_data="duration:day_end")],
+                [InlineKeyboardButton("3 часа", callback_data="duration:3hours")],
+                [InlineKeyboardButton("24 часа", callback_data="duration:24hours")],
+                [InlineKeyboardButton("1 неделя", callback_data="duration:week")],
+            ]
+            await query.edit_message_text(
+                f"🚗 Гостевой пропуск: {plate} (м/м #{spot_id})\n\nВыберите срок:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
         elif data.startswith("duration:"):
             parts = data.split(":")
             duration = parts[1]
             state = self.user_states.get(user_id, {})
             plate = state.get("plate")
-            if plate:
-                result = self.pass_handler.create_vehicle_pass(user_id, plate, duration)
-                await query.answer(result["message"])
-                await query.edit_message_text(
-                    f"✅ {result['message']}" if result["success"]
-                    else f"❌ {result['message']}"
-                )
-                self.user_states.pop(user_id, None)
-            else:
+            if not plate:
                 await query.answer("Сначала отправьте номер авто")
+                return
+
+            user = self.db.get_user(user_id)
+            access_group_id = user.get("default_access_group") if user else None
+            pass_type = state.get("type", "regular")
+
+            if pass_type == "guest":
+                spot_id = state.get("spot_id")
+                if not spot_id:
+                    await query.answer("Не выбрано машиноместо")
+                    return
+                result = self.pass_handler.create_guest_pass(
+                    user_id, plate,
+                    parking_spot_id=spot_id,
+                    access_group_id=access_group_id,
+                    duration=duration,
+                )
+            else:
+                result = self.pass_handler.create_vehicle_pass(
+                    user_id, plate,
+                    access_group_id=access_group_id,
+                    duration=duration,
+                )
+
+            await query.answer(result["message"][:200])
+            await query.edit_message_text(
+                f"✅ {result['message']}" if result["success"]
+                else f"❌ {result['message']}"
+            )
+            self.user_states.pop(user_id, None)
 
         elif data == FEEDBACK_BUTTON_CALLBACK:
             self.user_states[user_id] = {"waiting_feedback": True}
@@ -496,14 +834,13 @@ class TelegramBot:
 
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             keyboard = [
-                [InlineKeyboardButton("До конца дня", callback_data="duration:day_end")],
-                [InlineKeyboardButton("3 часа", callback_data="duration:3hours")],
-                [InlineKeyboardButton("24 часа", callback_data="duration:24hours")],
-                [InlineKeyboardButton("1 неделя", callback_data="duration:week")],
+                [InlineKeyboardButton("Разовый на погрузку (40 мин)", callback_data="type:loading")],
+                [InlineKeyboardButton("Гостевой (с м/м)", callback_data="type:guest")],
+                [InlineKeyboardButton("Обычный", callback_data="type:regular")],
             ]
 
             await update.message.reply_text(
-                f"🚗 Создание пропуска: {plate}\n\nВыберите срок:",
+                f"🚗 Создание пропуска: {plate}\n\nВыберите тип пропуска:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
         else:
@@ -522,6 +859,10 @@ class TelegramBot:
             **result.to_dict()
         )
 
+        if getattr(result, 'is_duplicate', False):
+            logger.debug(f"Skipping duplicate plate: {result.normalized_plate}")
+            return
+
         if result.normalized_plate:
             gate_result = self.gate_controller.check_plate_and_open(
                 result.camera_id, result.normalized_plate, event_id
@@ -529,6 +870,24 @@ class TelegramBot:
 
             if gate_result["gate_opened"]:
                 logger.info(f"Gate opened for {result.normalized_plate}")
+
+            # Trigger notifications based on gate result
+            if self.notification_scheduler:
+                if not gate_result["pass_found"]:
+                    self.notification_scheduler.notify_unauthorized_entry(
+                        result.normalized_plate, result.camera_id
+                    )
+                elif gate_result["gate_opened"] and gate_result.get("direction") in ("entry", "both"):
+                    # Check if this is a guest pass and notify owner
+                    pass_data = self.db.get_pass(gate_result["pass_id"]) if gate_result.get("pass_id") else None
+                    if pass_data and pass_data.get("pass_subtype") == "guest":
+                        owner_user_id = pass_data.get("user_id")
+                        spot_id = pass_data.get("parking_spot_id")
+                        if owner_user_id:
+                            self.notification_scheduler.schedule_guest_arrival_notification(
+                                owner_user_id, result.normalized_plate,
+                                str(spot_id) if spot_id else ""
+                            )
 
         if self._bot and self.config.tech_chat_id and self._bot_loop:
             result_data = result.to_dict()

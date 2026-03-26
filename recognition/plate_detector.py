@@ -8,29 +8,85 @@ logger = logging.getLogger(__name__)
 
 class PlateDetector:
     def __init__(self, weights_path: str = "models/license_plate_detector.pt",
-                 device: str = "cpu", confidence: float = 0.5):
+                 device: str = "cpu", confidence: float = 0.5,
+                 tensorrt_enabled: bool = True):
         self.weights_path = weights_path
         self.device = device
         self.confidence = confidence
+        self.tensorrt_enabled = tensorrt_enabled
         self.model = None
         self._loaded = False
+
+    def _get_engine_path(self, pt_path: str) -> str:
+        return pt_path.rsplit(".", 1)[0] + ".engine"
+
+    def _try_load_tensorrt(self, pt_path: str):
+        engine_path = self._get_engine_path(pt_path)
+        if os.path.exists(engine_path):
+            try:
+                from ultralytics import YOLO
+                self.model = YOLO(engine_path)
+                logger.info(f"Plate detector loaded (TensorRT): {engine_path}")
+                return True
+            except Exception as e:
+                logger.warning(f"Plate detector: failed to load existing TensorRT engine '{engine_path}': {e}")
+                return False
+        # Verify TensorRT package is available before attempting export
+        try:
+            import tensorrt  # noqa: F401
+        except ImportError:
+            logger.warning(
+                "Plate detector: 'tensorrt' package not found — skipping TensorRT export, "
+                "falling back to .pt model."
+            )
+            return False
+        try:
+            from ultralytics import YOLO
+            logger.info(
+                f"Plate detector: starting TensorRT export for '{pt_path}' "
+                f"(this may take several minutes on first run) …"
+            )
+            model = YOLO(pt_path)
+            dev = int(self.device.split(":")[-1]) if "cuda" in str(self.device) else 0
+            model.export(format="engine", half=True, device=dev)
+            if os.path.exists(engine_path):
+                self.model = YOLO(engine_path)
+                logger.info(f"Plate detector exported and loaded (TensorRT): {engine_path}")
+                return True
+            logger.warning(
+                f"Plate detector: TensorRT export completed but engine file not found at '{engine_path}'. "
+                "Falling back to .pt model."
+            )
+        except Exception as e:
+            logger.warning(
+                f"Plate detector: TensorRT export failed — falling back to .pt model. Error: {e}"
+            )
+        return False
 
     def load(self):
         if self._loaded:
             return
         try:
             from ultralytics import YOLO
-            if os.path.exists(self.weights_path):
-                self.model = YOLO(self.weights_path)
-                logger.info(f"Plate detector loaded: {self.weights_path}")
-            else:
+            if not os.path.exists(self.weights_path):
                 logger.warning(f"Plate detector weights not found: {self.weights_path}")
+                self._loaded = True
+                return
+
+            if self.tensorrt_enabled and self.device != "cpu":
+                if self._try_load_tensorrt(self.weights_path):
+                    self._loaded = True
+                    return
+
+            self.model = YOLO(self.weights_path)
+            logger.info(f"Plate detector loaded: {self.weights_path}")
             self._loaded = True
         except ImportError:
             logger.warning("ultralytics not available, using simulation mode")
             self._loaded = True
         except Exception as e:
             logger.error(f"Failed to load plate detector: {e}")
+            self._loaded = True
 
     def detect(self, frame: np.ndarray) -> Dict[str, Any]:
         result = {
@@ -56,7 +112,15 @@ class PlateDetector:
                 x1, y1, x2, y2, score, class_id = det
                 if int(class_id) == 0 and score > self.confidence and score > best_score:
                     best_score = score
+                    h, w = frame.shape[:2]
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # Clamp coordinates to frame dimensions
+                    x1 = max(0, min(x1, w))
+                    y1 = max(0, min(y1, h))
+                    x2 = max(0, min(x2, w))
+                    y2 = max(0, min(y2, h))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
                     plate_img = frame[y1:y2, x1:x2].copy()
                     best_detection = {
                         "detected": True,

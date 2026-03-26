@@ -126,13 +126,21 @@ class ParsecAPI:
 
     def get_bot_session_id(self) -> Optional[str]:
         if self._bot_session:
-            return self._bot_session["session_id"]
+            sid = self._bot_session["session_id"]
+            if self.continue_session(sid):
+                return sid
+            # Session expired, re-open
+            self._bot_session = None
         sess = self.open_bot_session()
         return sess["session_id"] if sess else None
 
     def get_admin_session_id(self) -> Optional[str]:
         if self._admin_session:
-            return self._admin_session["session_id"]
+            sid = self._admin_session["session_id"]
+            if self.continue_session(sid):
+                return sid
+            # Session expired, re-open
+            self._admin_session = None
         sess = self.open_admin_session()
         return sess["session_id"] if sess else None
 
@@ -304,6 +312,30 @@ class ParsecAPI:
         except Exception as e:
             logger.error(f"GetPersonIdentifiers error: {e}")
             return []
+
+    def get_all_identifiers(self, session_id: str) -> Optional[List[Dict]]:
+        """Get all identifiers (tags + plates) across all persons.
+        Returns None if the bulk API is not available."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return None
+            result = client.service.GetAllIdentifiers(session_id)
+            if not result or getattr(result, 'Result', -1) != 0:
+                return None
+            identifiers = []
+            for item in getattr(result, 'IdentifiersList', []):
+                identifiers.append({
+                    "id": getattr(item, 'ID', ''),
+                    "person_id": getattr(item, 'PersonID', ''),
+                    "code": getattr(item, 'Code', ''),
+                    "name": getattr(item, 'Name', ''),
+                    "identif_type": getattr(item, 'IdentifType', -1),
+                })
+            return identifiers
+        except Exception as e:
+            logger.warning(f"get_all_identifiers not available: {e}")
+            return None
 
     def open_person_editing_session(self, session_id: str, person_id: str) -> Optional[str]:
         try:
@@ -696,6 +728,263 @@ class ParsecAPI:
         except Exception as e:
             logger.error(f"GetVersion error: {e}")
             return None
+
+    # --- Новые методы для ТЗ пропускного режима ---
+
+    def check_role(self, session_id: str, role_name: str) -> bool:
+        """Проверка прав оператора. Роли: EmployeeReader, EmployeeWriter,
+        HardwareControl, GuestReader, VisitorRequestCreator и др."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            result = client.service.CheckRole(session_id, role_name)
+            return result is not None and result.Result == 0
+        except Exception as e:
+            logger.error(f"CheckRole error: {e}")
+            return False
+
+    def block_person(self, session_id: str, person_id: str) -> bool:
+        """Блокировка доступа (чёрный список)."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            result = client.service.BlockPerson(session_id, person_id)
+            if result and result.Result == 0:
+                logger.info(f"Person {person_id} blocked")
+                return True
+            if result:
+                logger.error(f"BlockPerson failed: {getattr(result, 'ErrorMessage', 'unknown')}")
+            return False
+        except Exception as e:
+            logger.error(f"BlockPerson error: {e}")
+            return False
+
+    def unblock_person(self, session_id: str, person_id: str) -> bool:
+        """Разблокировка доступа."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            result = client.service.UnblockPerson(session_id, person_id)
+            if result and result.Result == 0:
+                logger.info(f"Person {person_id} unblocked")
+                return True
+            if result:
+                logger.error(f"UnblockPerson failed: {getattr(result, 'ErrorMessage', 'unknown')}")
+            return False
+        except Exception as e:
+            logger.error(f"UnblockPerson error: {e}")
+            return False
+
+    def find_person_by_identifier(self, session_id: str, code: str) -> Optional[Dict]:
+        """Поиск человека по коду идентификатора (метки или номера)."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return None
+            result = client.service.FindPersonByIdentifier(session_id, code)
+            if not result or result.Result != 0:
+                return None
+            person = result.Value
+            if not person:
+                return None
+            return {
+                "id": str(person.ID),
+                "last_name": getattr(person, "LAST_NAME", ""),
+                "first_name": getattr(person, "FIRST_NAME", ""),
+                "middle_name": getattr(person, "MIDDLE_NAME", ""),
+                "tab_num": getattr(person, "TAB_NUM", ""),
+                "org_id": str(getattr(person, "ORG_ID", "")),
+            }
+        except Exception as e:
+            logger.error(f"FindPersonByIdentifier error: {e}")
+            return None
+
+    def send_plate_recognition(self, session_id: str, territory_id: str,
+                                plate_number: str) -> bool:
+        """Отправка распознанного номера в Parsec для идентификации.
+        Parsec сам принимает решение о допуске на основе своей БД."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            result = client.service.SendIdentificationCommand(
+                session_id, territory_id, plate_number
+            )
+            if result and result.Result == 0:
+                logger.info(f"Plate recognition sent: territory={territory_id}, plate={plate_number}")
+                return True
+            if result:
+                logger.error(f"SendIdentificationCommand failed: {getattr(result, 'ErrorMessage', 'unknown')}")
+            return False
+        except Exception as e:
+            logger.error(f"SendIdentificationCommand error: {e}")
+            return False
+
+    def send_verification_command(self, session_id: str, territory_id: str,
+                                   person_id: str) -> bool:
+        """Отправка команды верификации прохода (для GPU-камер, эмуляция считывания).
+        Parsec сам принимает решение о допуске."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            result = client.service.SendVerificationCommand(
+                session_id, territory_id, person_id
+            )
+            if result and result.Result == 0:
+                logger.info(f"Verification command sent: territory={territory_id}, person={person_id}")
+                return True
+            if result:
+                logger.error(f"SendVerificationCommand failed: {getattr(result, 'ErrorMessage', 'unknown')}")
+            return False
+        except Exception as e:
+            logger.error(f"SendVerificationCommand error: {e}")
+            return False
+
+    def get_hardware_events(self, session_id: str) -> List[Dict]:
+        """Получение оперативных событий от контроллеров (для мониторинга штатных камер Parsec)."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return []
+            events = client.service.GetHardwareEvents(session_id)
+            if not events:
+                return []
+            result = []
+            for ev in events:
+                result.append({
+                    "date": str(getattr(ev, "EventDate", "")),
+                    "type": getattr(ev, "EventType", None),
+                    "code": getattr(ev, "CODE", ""),
+                    "person_index": getattr(ev, "EventPersonIndex", None),
+                    "territory_index": getattr(ev, "EventTerritoryIndex", None),
+                })
+            return result
+        except Exception as e:
+            logger.error(f"GetHardwareEvents error: {e}")
+            return []
+
+    def open_event_history_session(self, session_id: str,
+                                    start_date=None, end_date=None,
+                                    territories: List[str] = None,
+                                    transaction_types: List[int] = None,
+                                    max_results: int = 5000) -> Optional[str]:
+        """Открытие сессии истории событий для отчётов."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return None
+            EventHistoryQueryParamsType = self._get_type("EventHistoryQueryParams")
+            if EventHistoryQueryParamsType is None:
+                return None
+            params = EventHistoryQueryParamsType()
+            if start_date:
+                params.StartDate = start_date
+            if end_date:
+                params.EndDate = end_date
+            if territories:
+                params.Territories = territories
+            if transaction_types:
+                params.TransactionTypes = transaction_types
+            params.MaxResultSize = max_results
+            result = client.service.OpenEventHistorySession(session_id, params)
+            if result and result.Result == 0:
+                return str(result.Value)
+            return None
+        except Exception as e:
+            logger.error(f"OpenEventHistorySession error: {e}")
+            return None
+
+    def get_event_history_result(self, history_session_id: str) -> List[Dict]:
+        """Получение результатов из сессии истории событий."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return []
+            result = client.service.GetEventHistoryResult(history_session_id)
+            if not result or not hasattr(result, 'Value') or not result.Value:
+                return []
+            events = []
+            for ev_obj in result.Value:
+                values = getattr(ev_obj, 'Values', [])
+                events.append({
+                    "values": [str(v) for v in values] if values else [],
+                })
+            return events
+        except Exception as e:
+            logger.error(f"GetEventHistoryResult error: {e}")
+            return []
+
+    def get_event_history_result_count(self, history_session_id: str) -> int:
+        """Количество событий в сессии истории."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return 0
+            result = client.service.GetEventHistoryResultCount(history_session_id)
+            if result and result.Result == 0:
+                return result.Value or 0
+            return 0
+        except Exception as e:
+            logger.error(f"GetEventHistoryResultCount error: {e}")
+            return 0
+
+    def close_event_history_session(self, history_session_id: str):
+        """Закрытие сессии истории событий."""
+        try:
+            client = self._ensure_client()
+            if client:
+                client.service.CloseEventHistorySession(history_session_id)
+        except Exception as e:
+            logger.error(f"CloseEventHistorySession error: {e}")
+
+    def create_visitor_request(self, session_id: str, org_unit_id: str,
+                                person_id: str, purpose: str = "",
+                                admit_start=None, admit_end=None) -> Optional[str]:
+        """Создание заявки бюро пропусков (для гостевых пропусков)."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return None
+            VisitorRequestType = self._get_type("VisitorRequest")
+            if VisitorRequestType is None:
+                logger.warning("VisitorRequest type not available")
+                return None
+            request = VisitorRequestType(
+                ORGUNIT_ID=org_unit_id,
+                PERSON_ID=person_id,
+                PURPOSE=purpose,
+            )
+            if admit_start:
+                request.ADMIT_START = admit_start
+            if admit_end:
+                request.ADMIT_END = admit_end
+            result = client.service.CreateVisitorRequest(session_id, request)
+            if result and result.Result == 0:
+                return str(result.Value)
+            if result:
+                logger.error(f"CreateVisitorRequest failed: {getattr(result, 'ErrorMessage', 'unknown')}")
+            return None
+        except Exception as e:
+            logger.error(f"CreateVisitorRequest error: {e}")
+            return None
+
+    def activate_visitor_request(self, session_id: str, request_id: str) -> bool:
+        """Активация заявки бюро пропусков."""
+        try:
+            client = self._ensure_client()
+            if not client:
+                return False
+            result = client.service.ActivateVisitorRequest(session_id, request_id)
+            if result and result.Result == 0:
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"ActivateVisitorRequest error: {e}")
+            return False
 
     def check_connection(self) -> bool:
         try:

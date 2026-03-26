@@ -10,6 +10,7 @@ from recognition.vehicle_detector import VehicleDetector
 from recognition.plate_detector import PlateDetector
 from recognition.ocr_engine import OCREngine
 from recognition.camera_manager import CameraManager
+from recognition.plate_tracker import PlateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class RecognitionResult:
         self.ocr_confidence = 0.0
         self.normalized_plate = ""
         self.is_valid_ru = False
+        self.is_duplicate: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -52,7 +54,8 @@ class RecognitionResult:
 
 
 class CameraDetectors:
-    def __init__(self, camera_id: str, config: Dict[str, Any]):
+    def __init__(self, camera_id: str, config: Dict[str, Any],
+                 shared_ocr: Optional[OCREngine] = None):
         self.camera_id = camera_id
         weights_dir = config.get("models_dir", "models")
         cam_weights_v = os.path.join(weights_dir, f"{camera_id}_vehicle.pt")
@@ -61,21 +64,35 @@ class CameraDetectors:
         vehicle_weights = cam_weights_v if os.path.exists(cam_weights_v) else config.get("weights_vehicle", "models/yolo26n.pt")
         plate_weights = cam_weights_p if os.path.exists(cam_weights_p) else config.get("weights_plate", "models/license_plate_detector.pt")
 
+        if not os.path.exists(cam_weights_v):
+            logger.warning(f"Per-camera vehicle weights not found for {camera_id}, "
+                           f"falling back to default: {vehicle_weights}")
+        if not os.path.exists(cam_weights_p):
+            logger.warning(f"Per-camera plate weights not found for {camera_id}, "
+                           f"falling back to default: {plate_weights}")
+
         device = config.get("device", "cpu")
+        tensorrt_enabled = config.get("tensorrt_enabled", True)
 
         self.vehicle_detector = VehicleDetector(
             weights_path=vehicle_weights,
             device=device,
-            confidence=config.get("confidence_vehicle", 0.5)
+            confidence=config.get("confidence_vehicle", 0.5),
+            tensorrt_enabled=tensorrt_enabled,
         )
         self.plate_detector = PlateDetector(
             weights_path=plate_weights,
             device=device,
-            confidence=config.get("confidence_plate", 0.5)
+            confidence=config.get("confidence_plate", 0.5),
+            tensorrt_enabled=tensorrt_enabled,
         )
-        self.ocr_engine = OCREngine(
+        self.ocr_engine = shared_ocr or OCREngine(
             gpu=config.get("gpu_enabled", False),
             confidence=config.get("confidence_ocr", 0.4)
+        )
+        self.plate_tracker = PlateTracker(
+            cooldown_seconds=config.get("plate_cooldown_seconds", 30.0),
+            vote_threshold=config.get("plate_vote_threshold", 2),
         )
 
     def load_all(self):
@@ -95,14 +112,38 @@ class RecognitionPipeline:
         self._last_process_time: Dict[str, float] = {}
         self.snapshots_dir = config.get("snapshots_dir", "data/snapshots")
         os.makedirs(self.snapshots_dir, exist_ok=True)
+        # Shared OCR engine singleton for cross-camera batching
+        ocr_backend = config.get("ocr_backend", "easyocr")
+        self.shared_ocr = OCREngine(
+            languages=config.get("ocr_languages", ["en"]),
+            gpu=config.get("gpu", False),
+            confidence=config.get("ocr_confidence", 0.4),
+            backend=ocr_backend,
+        )
 
     def add_camera(self, camera_id: str, stream_url: str, name: str = "",
                    mask_path: str = ""):
         self.camera_manager.add_camera(camera_id, stream_url, name, mask_path)
-        self.detectors[camera_id] = CameraDetectors(camera_id, self.config)
+        self.detectors[camera_id] = CameraDetectors(camera_id, self.config,
+                                                      shared_ocr=self.shared_ocr)
 
     def set_result_callback(self, callback: Callable):
         self._on_result_callback = callback
+
+    def _cleanup_trackers(self):
+        """Cleanup stale plate tracks across all cameras."""
+        for camera_id, det in self.detectors.items():
+            det.plate_tracker.cleanup(max_age_seconds=300.0)
+
+    def _cleanup_timer_loop(self):
+        """Periodic cleanup thread: runs every 60 seconds while pipeline is active."""
+        while self._running:
+            time.sleep(60)
+            if self._running:
+                try:
+                    self._cleanup_trackers()
+                except Exception as e:
+                    logger.error(f"Plate tracker cleanup error: {e}")
 
     def start(self):
         self._running = True
@@ -110,6 +151,10 @@ class RecognitionPipeline:
         for det in self.detectors.values():
             det.load_all()
         self.camera_manager.start()
+        cleanup_thread = threading.Thread(
+            target=self._cleanup_timer_loop, daemon=True, name="plate-tracker-cleanup"
+        )
+        cleanup_thread.start()
         logger.info("Recognition pipeline started")
 
     def stop(self):
@@ -186,6 +231,22 @@ class RecognitionPipeline:
             result.ocr_confidence = ocr["confidence"]
             result.normalized_plate = ocr["normalized"]
             result.is_valid_ru = ocr["is_valid_ru"]
+
+            if result.normalized_plate:
+                track_result = det.plate_tracker.update(
+                    result.normalized_plate, result.ocr_confidence
+                )
+
+                if not track_result["is_new_event"]:
+                    # Duplicate detection within cooldown - skip gate trigger
+                    logger.debug(
+                        f"Plate {result.normalized_plate} duplicate suppressed "
+                        f"(camera {camera_id})"
+                    )
+                    result.is_duplicate = True
+                else:
+                    # Use best reading from tracker for improved accuracy
+                    result.normalized_plate = track_result["best_plate"]
 
         return result
 
